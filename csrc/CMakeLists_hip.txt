@@ -1,0 +1,387 @@
+# Copyright (c) 2025, Osayamen Jonathan Aimuyo
+# All rights reserved.
+#
+# This file is part of the FlashMoE Project and is licensed under the BSD 3-Clause License.
+# See the LICENSE file in the root directory for full terms.
+#
+# HIP Port for AMD GPUs (gfx1250/gfx1250)
+
+cmake_minimum_required(VERSION 3.27)
+
+# Enable HIP language support
+project(flashmoe_hip HIP CXX)
+
+# ============================================================================
+# Configuration Variables
+# ============================================================================
+
+# ROCm SDK path - can be overridden via command line
+if(NOT DEFINED ROCM_SDK_ROOT)
+    set(ROCM_SDK_ROOT "$ENV{ROCM_SDK_ROOT}")
+    if(NOT ROCM_SDK_ROOT)
+        set(ROCM_SDK_ROOT "/jam/moe/venv/lib/python3.12/site-packages/_rocm_sdk_devel")
+    endif()
+endif()
+
+# rocSHMEM path - can be overridden via command line
+if(NOT DEFINED ROCSHMEM_ROOT)
+    set(ROCSHMEM_ROOT "$ENV{ROCSHMEM_ROOT}")
+    if(NOT ROCSHMEM_ROOT)
+        set(ROCSHMEM_ROOT "/jam/moe/rocm-systems/projects/rocshmem")
+    endif()
+endif()
+
+message(STATUS "ROCm SDK Root: ${ROCM_SDK_ROOT}")
+message(STATUS "rocSHMEM Root: ${ROCSHMEM_ROOT}")
+
+# ============================================================================
+# Target GPU Architectures
+# ============================================================================
+
+# Target AMD GPU architecture: gfx1250
+set(GPU_TARGETS "gfx1250" CACHE STRING "GPU architectures to target")
+set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+
+message(STATUS "Target GPU Architectures: ${GPU_TARGETS}")
+
+# ============================================================================
+# C++ Standard and Compiler Flags
+# ============================================================================
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+set(CMAKE_HIP_STANDARD 20)
+set(CMAKE_HIP_STANDARD_REQUIRED ON)
+set(CMAKE_HIP_EXTENSIONS OFF)
+
+# Common warning flags for CXX
+set(FLASHMOE_CXX_FLAGS "-Wall -Wextra")
+set(FLASHMOE_CXX_FLAGS "${FLASHMOE_CXX_FLAGS} -fno-strict-aliasing")
+set(FLASHMOE_CXX_FLAGS "${FLASHMOE_CXX_FLAGS} -Wno-unknown-pragmas -Wnull-dereference -Wnarrowing")
+set(FLASHMOE_CXX_FLAGS "${FLASHMOE_CXX_FLAGS} -Wno-switch -Wformat=2")
+set(FLASHMOE_CXX_FLAGS "${FLASHMOE_CXX_FLAGS} -Wno-unused-but-set-parameter")
+set(FLASHMOE_CXX_FLAGS "${FLASHMOE_CXX_FLAGS} -Wno-sign-compare")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLASHMOE_CXX_FLAGS}")
+
+# HIP-specific compiler flags
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -std=c++20")
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -fgpu-rdc")  # GPU relocatable device code for cross-TU calls
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wall")
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-unused-result")
+
+# Add architecture-specific flags
+foreach(GPU_TARGET ${GPU_TARGETS})
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --offload-arch=${GPU_TARGET}")
+endforeach()
+
+# ============================================================================
+# Find Required Packages
+# ============================================================================
+
+# Set CMAKE_PREFIX_PATH for package discovery
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}")
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}/lib/cmake")
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}/lib/cmake/hip")
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}/lib/cmake/hipcub")
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}/lib/cmake/rocprim")
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}/lib/cmake/rocwmma")
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_SDK_ROOT}/lib/cmake/hipblaslt")
+
+# HIP Runtime (required)
+find_package(hip REQUIRED CONFIG)
+if(hip_FOUND)
+    message(STATUS "Found HIP: ${hip_VERSION}")
+else()
+    message(FATAL_ERROR "HIP not found. Please ensure ROCm is installed.")
+endif()
+
+# hipCUB - HIP parallel primitives (CUB equivalent)
+find_package(hipcub REQUIRED CONFIG)
+if(hipcub_FOUND)
+    message(STATUS "Found hipCUB: ${hipcub_VERSION}")
+endif()
+
+# rocPRIM - ROCm Parallel Primitives
+find_package(rocprim REQUIRED CONFIG)
+if(rocprim_FOUND)
+    message(STATUS "Found rocPRIM: ${rocprim_VERSION}")
+endif()
+
+# rocWMMA - Matrix Multiply Accumulate library for AMD GPUs
+find_package(rocwmma REQUIRED CONFIG)
+if(rocwmma_FOUND)
+    message(STATUS "Found rocWMMA: ${rocwmma_VERSION}")
+endif()
+
+# hipBLASLt - Lightweight BLAS library
+find_package(hipblaslt REQUIRED CONFIG)
+if(hipblaslt_FOUND)
+    message(STATUS "Found hipBLASLt: ${hipblaslt_VERSION}")
+endif()
+
+# MPI (optional for distributed workloads)
+find_package(MPI COMPONENTS CXX)
+if(MPI_FOUND)
+    message(STATUS "Found MPI: ${MPI_CXX_VERSION}")
+endif()
+
+# ============================================================================
+# Include and Library Directories
+# ============================================================================
+
+# ROCm SDK includes
+include_directories(SYSTEM ${ROCM_SDK_ROOT}/include)
+include_directories(SYSTEM ${ROCM_SDK_ROOT}/include/hip)
+include_directories(SYSTEM ${ROCM_SDK_ROOT}/include/hipcub)
+include_directories(SYSTEM ${ROCM_SDK_ROOT}/include/rocprim)
+include_directories(SYSTEM ${ROCM_SDK_ROOT}/include/rocwmma)
+include_directories(SYSTEM ${ROCM_SDK_ROOT}/include/hipblaslt)
+
+# rocSHMEM includes
+include_directories(SYSTEM ${ROCSHMEM_ROOT}/include)
+
+# Project includes
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Library directories
+link_directories(${ROCM_SDK_ROOT}/lib)
+link_directories(${ROCSHMEM_ROOT}/lib)
+
+# ============================================================================
+# Compile Definitions
+# ============================================================================
+
+# Define HIP-specific macros
+add_compile_definitions(
+    __HIP_PLATFORM_AMD__
+    FLASHMOE_HIP=1
+    FLASHMOE_ARCH_GFX1250=1
+)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Function to configure common target properties for HIP targets
+function(flashmoe_hip_target_common tgt)
+    # Link against HIP runtime and AMD libraries
+    target_link_libraries(${tgt} PRIVATE
+        hip::device
+        hip::host
+        roc::hipcub
+        roc::rocprim
+        roc::rocwmma
+        roc::hipblaslt
+    )
+
+    # Link atomic library
+    target_link_libraries(${tgt} PRIVATE atomic)
+
+    # rocSHMEM if available
+    if(EXISTS "${ROCSHMEM_ROOT}/lib/librocshmem.so")
+        target_link_libraries(${tgt} PRIVATE rocshmem)
+    endif()
+
+    # Set HIP-specific compile options
+    target_compile_options(${tgt} PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>
+        $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-result>
+    )
+
+    # Add architecture-specific options
+    foreach(GPU_TARGET ${GPU_TARGETS})
+        target_compile_options(${tgt} PRIVATE
+            $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=${GPU_TARGET}>
+        )
+    endforeach()
+
+    # Debug vs Release flags
+    target_compile_options(${tgt} PRIVATE
+        $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
+        $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:HIP>>:-O0;-g;-ggdb>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:HIP>>:-O3>
+    )
+
+    # Target include directories
+    target_include_directories(${tgt} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${ROCM_SDK_ROOT}/include
+        ${ROCSHMEM_ROOT}/include
+    )
+
+    # Compile definitions
+    target_compile_definitions(${tgt} PRIVATE
+        __HIP_PLATFORM_AMD__
+        FLASHMOE_HIP=1
+    )
+endfunction()
+
+# Function for test targets with minimal dependencies
+function(flashmoe_hip_target_test tgt)
+    target_link_libraries(${tgt} PRIVATE
+        hip::device
+        hip::host
+        roc::hipcub
+        roc::rocprim
+    )
+
+    target_link_libraries(${tgt} PRIVATE atomic)
+
+    # Set HIP-specific compile options
+    target_compile_options(${tgt} PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>
+    )
+
+    # Add architecture-specific options
+    foreach(GPU_TARGET ${GPU_TARGETS})
+        target_compile_options(${tgt} PRIVATE
+            $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=${GPU_TARGET}>
+        )
+    endforeach()
+
+    # Debug vs Release flags
+    target_compile_options(${tgt} PRIVATE
+        $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
+        $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:HIP>>:-O0;-g;-ggdb>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
+        $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:HIP>>:-O3>
+    )
+
+    target_compile_definitions(${tgt} PRIVATE
+        __HIP_PLATFORM_AMD__
+        FLASHMOE_HIP=1
+    )
+endfunction()
+
+# ============================================================================
+# Library Target: flashmoe_hip
+# ============================================================================
+
+# Collect HIP source files (renamed from .cu to .hip or .cpp)
+file(GLOB_RECURSE FLASHMOE_HIP_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+)
+
+# Create the flashmoe_hip library
+# Note: If sources don't exist yet, this creates an INTERFACE library
+if(FLASHMOE_HIP_SOURCES)
+    add_library(flashmoe_hip STATIC ${FLASHMOE_HIP_SOURCES})
+else()
+    # Create as interface library when no sources exist yet
+    add_library(flashmoe_hip INTERFACE)
+    message(STATUS "flashmoe_hip: No source files found, creating INTERFACE library")
+endif()
+
+# Apply common configuration if it's a real library
+if(FLASHMOE_HIP_SOURCES)
+    set_target_properties(flashmoe_hip PROPERTIES
+        HIP_SEPARABLE_COMPILATION ON
+        HIP_RESOLVE_DEVICE_SYMBOLS ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+    flashmoe_hip_target_common(flashmoe_hip)
+endif()
+
+# ============================================================================
+# Executable Targets (Tests)
+# ============================================================================
+
+# Note: Source files need to be renamed from .cu to .hip for HIP compilation
+# The tests below assume the sources have been ported
+
+# Main FlashMoE test
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/flashmoe.hip")
+    add_executable(testFlashMoE_hip tests/flashmoe.hip)
+    set_target_properties(testFlashMoE_hip PROPERTIES
+        HIP_SEPARABLE_COMPILATION ON
+        HIP_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    flashmoe_hip_target_common(testFlashMoE_hip)
+    if(MPI_FOUND)
+        target_link_libraries(testFlashMoE_hip PRIVATE MPI::MPI_CXX)
+    endif()
+endif()
+
+# Scheduler test
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler.hip")
+    add_executable(testScheduler_hip tests/scheduler.hip)
+    flashmoe_hip_target_test(testScheduler_hip)
+endif()
+
+# GEMM test
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/gemm.hip")
+    add_executable(testGEMM_hip tests/gemm.hip)
+    flashmoe_hip_target_common(testGEMM_hip)
+endif()
+
+# Playground
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/playground.hip")
+    add_executable(playground_hip tests/playground.hip)
+    flashmoe_hip_target_common(playground_hip)
+endif()
+
+# Gate test
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/gate.hip")
+    add_executable(testGate_hip tests/gate.hip)
+    flashmoe_hip_target_common(testGate_hip)
+endif()
+
+# Combine test
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/combine.hip")
+    add_executable(testCombine_hip tests/combine.hip)
+    flashmoe_hip_target_common(testCombine_hip)
+endif()
+
+# GEMM MNK test
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/gemmMNK.hip")
+    add_executable(gemmMNK_hip tests/gemmMNK.hip)
+    flashmoe_hip_target_common(gemmMNK_hip)
+endif()
+
+# ============================================================================
+# Installation
+# ============================================================================
+
+include(GNUInstallDirs)
+
+# Install library
+install(TARGETS flashmoe_hip
+    EXPORT flashmoe_hip-targets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Install headers
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.cuh" PATTERN "*.hpp" PATTERN "*.h"
+)
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+message(STATUS "")
+message(STATUS "========================================")
+message(STATUS "FlashMoE HIP Configuration Summary")
+message(STATUS "========================================")
+message(STATUS "Build Type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ Standard:      ${CMAKE_CXX_STANDARD}")
+message(STATUS "HIP Standard:      ${CMAKE_HIP_STANDARD}")
+message(STATUS "GPU Targets:       ${GPU_TARGETS}")
+message(STATUS "ROCm SDK:          ${ROCM_SDK_ROOT}")
+message(STATUS "rocSHMEM:          ${ROCSHMEM_ROOT}")
+message(STATUS "HIP Version:       ${hip_VERSION}")
+message(STATUS "hipCUB Version:    ${hipcub_VERSION}")
+message(STATUS "rocPRIM Version:   ${rocprim_VERSION}")
+message(STATUS "rocWMMA Version:   ${rocwmma_VERSION}")
+message(STATUS "hipBLASLt Version: ${hipblaslt_VERSION}")
+message(STATUS "MPI Found:         ${MPI_FOUND}")
+message(STATUS "========================================")
+message(STATUS "")
