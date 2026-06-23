@@ -1,4 +1,4 @@
-# gfx1250 TDM, mbarrier, and Wave-Cluster Notes
+# gfx1250 TDM and mbarrier Notes
 
 Primary references:
 
@@ -29,9 +29,6 @@ Relevant Clang builtins in the local AMD LLVM tree:
 - `__builtin_amdgcn_s_wait_tensorcnt`
 - `__builtin_amdgcn_ds_atomic_async_barrier_arrive_b64`
 - `__builtin_amdgcn_ds_atomic_barrier_arrive_rtn_b64`
-- `__builtin_amdgcn_s_cluster_barrier`
-- `__builtin_amdgcn_cluster_load_async_to_lds_b8/b32/b64/b128`
-- `__builtin_amdgcn_cluster_load_b32/b64/b128`
 
 ## gfx1250 mbarrier Model
 
@@ -92,34 +89,6 @@ The full gfx1250 megakernel should therefore use:
   independent of copy completion.
 - Global atomics for persistent work claiming and subscriber/task completion.
 
-## Wave Clusters and Multicast
-
-gfx1250 HIP/Triton paths expose workgroup clusters. Use the HIP launch attributes and
-Triton cluster-barrier lowering as the reference points.
-
-Relevant constraints and usage:
-
-- Cluster barriers use the same `S_BARRIER_SIGNAL` and `S_BARRIER_WAIT`
-  instruction family in LLVM lowering.
-- Triton lowers cluster barrier arrive/wait through the AMD backend.
-- When a dispatch is not launched as a cluster, cluster-barrier instructions
-  are NOPs.
-
-The HIP/Triton path exposes TDM multicast on tensor loads for clustered
-launches.
-
-Consequences for FlashMoE:
-
-- Use HIP extended launches with `hipLaunchAttributeClusterDimension` for any
-  multi-CTA fused path.
-- Query and validate the cluster shape at startup/test time before enabling a
-  clustered production path.
-- Use Triton's cluster-barrier lowering to align CTAs within a wave cluster.
-- Use TDM multicast for shared expert/input tiles across
-  cooperating CTAs.
-- Do not use LDS mbarriers for cross-CTA synchronization. They are local to one
-  workgroup's LDS.
-
 ## Megakernel Direction
 
 The Blackwell paper's TMA plus barrier pipeline maps to gfx1250 as:
@@ -128,18 +97,12 @@ The Blackwell paper's TMA plus barrier pipeline maps to gfx1250 as:
 - TMA completion mbarrier -> gfx1250 LDS mbarrier encoded in the TDM descriptor.
 - Warp specialization barriers -> named workgroup barriers, only if explicit
   producer/consumer wave rendezvous is still needed after the mbarrier design.
-- CTA cluster multicast -> cluster launch plus TDM multicast.
-- CTA cluster synchronization -> Triton's cluster-barrier lowering.
 
 The immediate implementation path is:
 
 1. Add minimal HIP probes for TDM load/store, LDS mbarrier manual arrive/wait,
    and TDM plus mbarrier completion.
-2. Add cluster-launch probes if `hipDeviceProp_t::clusterLaunch` is true,
-   including multidimensional cluster probes.
-3. Refactor the gfx1250 processor path to stage A/B tiles through TDM into
+2. Refactor the gfx1250 processor path to stage A/B tiles through TDM into
    double-buffered LDS.
-4. Use per-stage LDS mbarriers for TDM completion and keep rocWMMA compute
+3. Use per-stage LDS mbarriers for TDM completion and keep rocWMMA compute
    waves independent of global `s_wait_tensorcnt` waits.
-5. Add wave-cluster/multicast staging only after the single-CTA TDM pipeline is
-   correct and measurable.

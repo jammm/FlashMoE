@@ -17,11 +17,8 @@ The current package has three separate surfaces:
   runs the expert FFN, applies activation or gated/SwiGLU, and combines route
   outputs into the final tensor. The scheduler is persistent. For aligned
   `H=I=64` cases, GEMM0 and GEMM1 use an in-kernel TDM/WMMA tile path covering
-  top-1, top-2, and gated/SILU smoke coverage. With `num_ctas=2` and
-  `use_workgroup_cluster=True`, each clustered route task fuses GEMM0,
-  activation, optional gated value projection, GEMM1, and combine in the same
-  persistent task. Other shapes currently use the scalar persistent FFN
-  fallback.
+  top-1, top-2, and gated/SILU smoke coverage. Other shapes currently use the
+  scalar persistent FFN fallback.
 - `forward_scalar_top1_debug(...)`: a smaller single-kernel bring-up probe kept
   for compiler/runtime debugging.
 - `forward_decomposed_staging(...)`: a bring-up path that uses upstream Gluon
@@ -32,8 +29,8 @@ The current package has three separate surfaces:
 The runnable `forward_megakernel(...)` path has been exercised against CPU
 reference for top-1 and top-2 vanilla identity MLP, and for top-1 and top-2
 gated/SILU MLP. The default smoke configuration uses two resident Gluon
-programs. Dedicated probes validate scalar atomic participation, clustered
-phase barriers, clustered CGA layouts, and clustered TDM/WMMA gather.
+programs. Dedicated probes validate scalar atomic participation, global phase
+barriers, and single-workgroup TDM/WMMA gather.
 
 The next implementation step is to generalize the TDM/WMMA compute body to
 non-64 hidden/intermediate dimensions while preserving the same in-kernel route
@@ -50,7 +47,7 @@ forward_megakernel(...)
     per-token routing logits
     top-k selection and probability normalization
     expert-local route queues
-    persistent route-task claiming
+    OS-style scheduler and processor doorbells
     TDM/WMMA routed GEMM0 for aligned H=I=64 modes
     activation or gated epilogue
     TDM/WMMA routed GEMM1 for aligned H=I=64 modes
@@ -93,36 +90,40 @@ contract the final megakernel must satisfy inside the kernel.
 The current persistent implementation divides the kernel into resident programs
 and phases:
 
-- program 0 clears route counts, queue heads, barriers, and output state
+- program 0 clears route counts, scheduler mailboxes, barriers, and output
+  state
 - all programs route a strided subset of tokens and append accepted routes
 - all programs wait at device-side phase barriers between initialization,
-  routing, queue-head reset, route processing, and exit
-- processor programs repeatedly claim route tasks with an atomic queue head
-- each processor computes the route FFN and atomically combines into output
+  routing, scheduler reset, route processing, and exit
+- during compute phases, program 0 becomes the OS scheduler
+- programs 1..N-1 become Processor actors that publish readiness, wait on
+  per-program doorbells, execute assigned work, and publish readiness again
+- the scheduler assigns work-conserving tasks by writing task ids into
+  Processor doorbells and sends a terminal task after all work has drained
+- each processor computes the route FFN or tile task and combines into output
 
 Processor programs are persistent because they do not exit after one tile. A
 processor loop has this shape:
 
 ```text
 while not done:
-    task = claim_next_ready_task()
-    if task exists:
-        execute task
-        publish dependent work
-    else:
-        poll progress state
+    publish_ready()
+    task = wait_for_scheduler_doorbell()
+    if task is terminal:
+        break
+    execute task
+    publish dependent work
 ```
 
-The scheduler exits only after all expected tasks have been published and all
-completion counters have reached their terminal values. It then marks the
-global exit state so processor programs break out of their loops and return.
+The scheduler exits only after every Processor has reported ready after the
+last real task. It then sends each Processor a terminal task id so the
+Processor loops break out and return.
 
 The current scheduler uses phase barriers backed by device-scope atomics. The
 barrier increment is a scalar Gluon side effect, which the probe verifies runs
 once per program. Polling uses an acquire atomic add of zero, which behaves as
 an atomic load without mutating the counter. Plain volatile polling was not
-reliable for the multi-program path, and compare/exchange polling was not
-reliable after clustered TDM/WMMA work.
+reliable for the multi-program path.
 
 ## In-Kernel Initialization
 
@@ -190,10 +191,8 @@ tasks:
    pipeline.
 5. Load WMMA operands from LDS into registers.
 6. Execute `gl.amd.gfx1250.wmma`.
-7. In the clustered path, store the activated intermediate tile to LDS and run
-   GEMM1 immediately in the same route task.
-8. In the non-clustered path, write the GEMM0 intermediate tile to scratch and
-   consume it in the GEMM1 task loop.
+7. Write the GEMM0 intermediate tile to scratch.
+8. Consume the intermediate tile in the scheduled GEMM1 task loop.
 
 The key point is that TDM and WMMA are instructions emitted inside the Gluon
 kernel. They do not call a host GEMM library and they do not create additional
@@ -205,30 +204,25 @@ this replacement: TDM descriptors, TDM gather/scatter, shared-memory staging,
 is to generalize the integrated tile path beyond the current aligned shape
 without launching separate staging matmuls.
 
-## Workgroup Clusters And TDM Multicast
+## Dynamic Scheduling
 
-Gluon exposes gfx1250 cluster barriers through
-`gl.amd.gfx1250.cluster.arrive()` and `gl.amd.gfx1250.cluster.wait()`, and the
-runtime accepts `num_ctas` launch metadata for multi-CTA programs. The current
-default path keeps `num_ctas=1`. Clustered execution is enabled for the aligned
-TDM/WMMA path with `num_ctas=2`.
+The Gluon scheduler now follows the same actor shape as the CUDA path. Program
+0 owns scheduling during compute phases, while every other resident program is
+a Processor actor.
 
-The cluster path is implemented at the tile-compute level, not around the
-scalar FFN body:
+The scheduler state is device-resident:
 
-- use workgroup clusters to keep CTAs working on the same expert tile phase
-  aligned
-- use CGA-aware layouts for routed rows, WMMA accumulators, and shared memory
-- use TDM gather for routed token rows and TDM load for expert weight tiles
-- keep route queues and completion counters device-resident so clustered
-  compute still returns through one host-visible launch
-- validate clustered TDM load, cluster barrier, clustered route-task
-  completion, and CGA layout conversion as separate probes
+- `processor_ready[p]` records whether Processor `p` is ready for work.
+- `processor_mailboxes[p]` holds the task id assigned to Processor `p`, or
+  `-1` while no task is pending.
+- a terminal task id equal to the stage task count tells a Processor to exit
+  the current scheduled phase.
 
-TDM multicast for expert weight tiles is still a tuning target. The current
-clustered implementation uses the same single-dispatch persistent lifecycle and
-CGA-aware TDM/WMMA compute, but it does not yet enable multicast-specific TDM
-descriptors.
+The scheduler loops over ready Processors, assigns the next task id to each
+ready mailbox, and continues until all real tasks have been assigned. After
+that, it waits for each Processor to report ready one final time and sends the
+terminal task. This gives dynamic load balancing without requiring host
+intervention or a separate dispatch.
 
 ## Combine
 
@@ -272,7 +266,6 @@ launch is device-driven:
 - work queues live in device memory
 - processor programs loop over many tasks
 - GEMM0 and GEMM1 use in-kernel TDM/WMMA
-- clustered aligned route tasks fuse GEMM0, activation, GEMM1, and combine
 - combine is an in-kernel reduction task
 - rocSHMEM operations are emitted through device extern calls
 - scheduler state determines when all resident programs exit
@@ -281,8 +274,8 @@ No host code has to enqueue per-expert GEMM kernels or per-stage combine
 kernels between those steps. The current `forward_megakernel(...)` already
 preserves the one-dispatch persistent scheduler and has a TDM/WMMA tile path
 for the aligned smoke-test FFN cases. The remaining paper-parity work is
-generalizing that tile path beyond the current aligned shape and enabling TDM
-multicast.
+generalizing that tile path beyond the current aligned shape and connecting
+the rocSHMEM communication tasks.
 
 ## Implementation Checklist
 
@@ -293,8 +286,6 @@ multicast.
 3. Extend the current routed GEMM0 TDM/WMMA path beyond `H=I=64`.
 4. Keep activation and gated MLP epilogues fused into the single dispatch.
 5. Extend the current GEMM1 TDM/WMMA path beyond `H=I=64`.
-6. Extend the current workgroup-cluster tile execution beyond `num_ctas=2`.
-7. Enable TDM multicast for expert weight tiles.
-8. Link rocSHMEM bitcode and compile a minimal in-kernel communication path.
-9. Add the two-PE local smoke test after the host runtime initializes the
+6. Link rocSHMEM bitcode and compile a minimal in-kernel communication path.
+7. Add the two-PE local smoke test after the host runtime initializes the
    rocSHMEM HIP module correctly.

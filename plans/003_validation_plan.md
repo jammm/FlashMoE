@@ -45,7 +45,6 @@ Local PyTorch `torch.matmul` is currently wrong on this gfx1250 ROCm build, even
    - Compile and run a raw TDM load/store test using `hip/amd_detail/amd_gfx1250_TDM.h`, `__builtin_amdgcn_tensor_load_to_lds`, `__builtin_amdgcn_tensor_store_from_lds`, and `__builtin_amdgcn_s_wait_tensorcnt(0)`.
    - Compile and run a manual LDS mbarrier test using `__builtin_amdgcn_ds_atomic_barrier_arrive_rtn_b64`.
    - Compile and run a TDM-plus-mbarrier completion test using the Triton/LLVM lowering model.
-   - If `hipDeviceProp_t::clusterLaunch` is true, query cluster support and compile/run cluster launches. Then run a small cluster-barrier probe and a TDM multicast-mask probe.
 
 5. `tests/correctness_suite.hip.cpp`
    - Update wave-size expectations to use `flashmoe::WARP_SIZE` rather than hardcoded values.

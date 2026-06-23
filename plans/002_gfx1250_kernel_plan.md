@@ -22,7 +22,7 @@ gfx1250 does not provide the Blackwell semaphore path used by the original CUDA 
 
 - LDS mbarriers for async copy/TDM completion.
 - Named workgroup barriers for intra-block wave role rendezvous.
-- Cluster barriers for wave-cluster / multi-CTA synchronization.
+- Device-scope atomics for persistent scheduler doorbells and completion state.
 
 Detailed TDM and mbarrier notes are in `plans/004_gfx1250_tdm_mbarrier_notes.md`.
 
@@ -40,7 +40,6 @@ This is the completion mechanism for the gfx1250 version of the fully-fused mega
 TDM facts that matter for the implementation:
 
 - TheRock exposes `hip/amd_detail/amd_gfx1250_TDM.h`.
-- Triton exposes multicast support for clustered TDM loads.
 - Triton lowering attaches an LDS mbarrier to TDM operations for async completion.
 - TDM completion is counted by `TENSORcnt` and can also signal the attached LDS mbarrier.
 
@@ -59,17 +58,7 @@ Codegen constraints that affect the megakernel:
 - Barrier member counts are in waves, not threads. CUDA `bar.sync A, B` thread counts must be translated to `ceil(B / 32)` member waves on gfx1250.
 - A wave can join at most one named barrier at a time. It can signal any barrier, but `s_barrier_wait` waits on the most recently joined named barrier.
 - `s_barrier_init` or `s_barrier_signal_var` must set the member count before use.
-- Named barriers are workgroup-local only. They can replace CUDA-style producer/consumer synchronization between loader and compute waves inside one processor block; they cannot replace TDM completion mbarriers, cross-block/global semaphores, doorbells, or inter-GPU completion signals. Those paths must remain LDS mbarriers, atomics, cluster barriers, or rocSHMEM mechanisms as appropriate.
-
-## Wave Clusters
-
-gfx1250 HIP/Triton paths expose workgroup clusters and TDM multicast:
-
-- Cluster launches and TDM multicast should be validated with HIP runtime probes before enabling a clustered production path.
-- Triton exposes cluster-barrier lowering through the AMD backend.
-- Clustered TDM loads can multicast when launched with a supported cluster shape.
-
-The single-GPU implementation can still use multiple CTAs in one process. If we enable the wave-cluster path, launch with HIP cluster attributes and keep process count constrained for local validation.
+- Named barriers are workgroup-local only. They can replace CUDA-style producer/consumer synchronization between loader and compute waves inside one processor block; they cannot replace TDM completion mbarriers, cross-block/global semaphores, doorbells, or inter-GPU completion signals. Those paths must remain LDS mbarriers, device-scope atomics, or rocSHMEM mechanisms as appropriate.
 
 ## Current HIP Port Structure
 
@@ -128,12 +117,7 @@ Important routing invariant:
    - Track the expected phase per wave and wait on phase changes before rocWMMA consumption.
    - Keep `s_wait_tensorcnt` in probes and fallback/debug paths, not as the steady-state synchronization path.
 
-7. Wave-cluster multicast
-   - Probe `hipLaunchAttributeClusterDimension`, `hipDeviceProp_t::clusterLaunch`, and usable cluster shapes.
-   - Use Triton's cluster-barrier lowering for cross-CTA phase alignment.
-   - Use TDM multicast for shared tiles after single-CTA TDM staging is correct.
-
-8. CUDA-parity gate plus persistent MoE launch
+7. CUDA-parity gate plus persistent MoE launch
    - Keep the same boundary as the upstream CUDA path: gate/router launch first, persistent MoE launch second.
    - Remove HIP-only gate-weight, top-k, and route-epoch arguments from `moe::KernelArgs` and from the Python `ForwardArgs` surface.
    - Keep `Context::tokenIndices` as the shared routing handoff between router and MoE, with `[E, roundEC]` stride.
@@ -145,7 +129,6 @@ Important routing invariant:
 After the persistent WMMA path is correct:
 
 - Tune the CUDA-parity router path for larger `E` and multi-block gate reductions.
-- Use wave-cluster TDM multicast where it improves the standalone gate launch or persistent processor tiles without changing the CUDA API boundary.
 - Use transpose global/LDS loads for B tiles if rocWMMA layout conversion leaves bandwidth on the table.
 - Tune tile shapes beyond the paper's 128x64 for gfx1250 runtime behavior.
 - Revisit packed FP16/BF16 atomic accumulation for plural combine after isolating the gfx12 correctness issue.

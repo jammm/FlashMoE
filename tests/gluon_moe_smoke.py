@@ -112,9 +112,6 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=8e-2)
     parser.add_argument("--atol", type=float, default=8e-3)
     parser.add_argument("--num-programs", type=int, default=2)
-    parser.add_argument("--num-ctas", type=int, default=1)
-    parser.add_argument("--use-workgroup-cluster", action="store_true")
-    parser.add_argument("--launch-cooperative-grid", action="store_true")
     parser.add_argument("--disable-persistent", action="store_true")
     parser.add_argument("--disable-tdm-wmma", action="store_true")
     args = parser.parse_args()
@@ -196,9 +193,6 @@ def main() -> None:
             expert_up_v=up_v.cuda() if up_v is not None else None,
             bias_up_v=bias_up_v.cuda() if bias_up_v is not None else None,
             num_programs=args.num_programs,
-            num_ctas=args.num_ctas,
-            use_workgroup_cluster=args.use_workgroup_cluster,
-            launch_cooperative_grid=args.launch_cooperative_grid,
             use_persistent=not args.disable_persistent,
             use_tdm_wmma=not args.disable_tdm_wmma,
         )
