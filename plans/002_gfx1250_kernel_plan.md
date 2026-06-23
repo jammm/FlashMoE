@@ -37,24 +37,24 @@ Triton's gfx1250 backend confirms that gfx1250 has a usable mbarrier abstraction
 
 This is the completion mechanism for the gfx1250 version of the fully-fused megakernel. `s_wait_tensorcnt` remains useful for probes and conservative fallback paths, but the pipeline should use stage-local LDS mbarriers so compute waves wait only on the copy stage they consume.
 
-TDM descriptor facts that matter for the implementation:
+TDM facts that matter for the implementation:
 
 - TheRock exposes `hip/amd_detail/amd_gfx1250_TDM.h`.
-- `group1.workgroupMask` controls TDM multicast for loads in wave-cluster launches.
-- Public Triton lowering attaches an LDS mbarrier to TDM operations for async completion.
+- Triton exposes multicast support for clustered TDM loads.
+- Triton lowering attaches an LDS mbarrier to TDM operations for async completion.
 - TDM completion is counted by `TENSORcnt` and can also signal the attached LDS mbarrier.
 
 ## Named Barriers
 
 gfx12 named workgroup barriers are usable for intra-block warp specialization.
 
-Public codegen support:
+Codegen support:
 
 - Clang exposes gfx12 builtins for `__builtin_amdgcn_s_barrier_init`, `join`, `signal_var`, `wait`, `leave`, and state reads.
 - The barrier object must be declared as `__shared__ __amdgpu_named_workgroup_barrier_t` so the generated metadata records named-barrier usage.
 - With `__amdgpu_named_workgroup_barrier_t`, codegen emits `.amdhsa_named_barrier_count 1` and real `s_barrier_init`, `s_barrier_join`, `s_barrier_signal`, `s_barrier_wait`, and `s_barrier_leave` instructions.
 
-Public-codegen constraints that affect the megakernel:
+Codegen constraints that affect the megakernel:
 
 - Barrier member counts are in waves, not threads. CUDA `bar.sync A, B` thread counts must be translated to `ceil(B / 32)` member waves on gfx1250.
 - A wave can join at most one named barrier at a time. It can signal any barrier, but `s_barrier_wait` waits on the most recently joined named barrier.
@@ -63,11 +63,11 @@ Public-codegen constraints that affect the megakernel:
 
 ## Wave Clusters
 
-Public gfx1250 HIP/Triton paths expose workgroup clusters and TDM multicast:
+gfx1250 HIP/Triton paths expose workgroup clusters and TDM multicast:
 
 - Cluster launches and TDM multicast should be validated with HIP runtime probes before enabling a clustered production path.
 - Triton exposes cluster-barrier lowering through the AMD backend.
-- If `TENSOR_LOAD_TO_LDS` has a nonzero workgroup mask, TDM uses cluster-load-async behavior for multicast.
+- Clustered TDM loads can multicast when launched with a supported cluster shape.
 
 The single-GPU implementation can still use multiple CTAs in one process. If we enable the wave-cluster path, launch with HIP cluster attributes and keep process count constrained for local validation.
 
@@ -81,7 +81,7 @@ The single-GPU implementation can still use multiple CTAs in one process. If we 
 - Router and processor WMMA/TDM staging share `wmma_tdm.hip.cuh`, so descriptor setup and LDS mbarrier waits have one implementation.
 - Plural combine zeroes `moe_out` with host-side `hipMemsetAsync` before the MoE launch, matching the upstream CUDA path's contract.
 - FP16 plural combine uses scalar CAS-backed half atomics for contended top-k accumulation.
-- The HIP public path mirrors the CUDA launch/API boundary: `flashmoe_hip.router.forward()` launches the gate kernel to compute `expertCounts` and `Context::tokenIndices`; `flashmoe_hip.forward()` consumes precomputed routing metadata.
+- The HIP path mirrors the CUDA launch/API boundary: `flashmoe_hip.router.forward()` launches the gate kernel to compute `expertCounts` and `Context::tokenIndices`; `flashmoe_hip.forward()` consumes precomputed routing metadata.
 - The HIP gate path uses the shared gfx1250 WMMA/TDM tile helper when the gate tile is WMMA-legal (`bM`, `bN`, and `bK` aligned for 16x16x32 FP16/BF16 WMMA), with the scalar GEMM fallback preserved for boundary shapes.
 
 Important routing invariant:
@@ -123,15 +123,15 @@ Important routing invariant:
 6. TDM and mbarrier fused staging
    - Added HIP probes for raw TDM load/store, LDS mbarrier arrive/wait, and TDM completion into an LDS mbarrier.
    - Added per-wave 64-bit LDS mbarriers and TDM A/B staging buffers in the gfx1250 processor workspace.
-   - Stage A/B tiles through LDS with `TENSOR_LOAD_TO_LDS`.
+   - Stage A/B tiles through LDS with TDM.
    - Attach the LDS mbarrier to the TDM descriptor for B-tile completion after the A-tile load has been issued by the same wave.
    - Track the expected phase per wave and wait on phase changes before rocWMMA consumption.
    - Keep `s_wait_tensorcnt` in probes and fallback/debug paths, not as the steady-state synchronization path.
 
 7. Wave-cluster multicast
    - Probe `hipLaunchAttributeClusterDimension`, `hipDeviceProp_t::clusterLaunch`, and usable cluster shapes.
-   - Use the public Triton cluster-barrier lowering for cross-CTA phase alignment.
-   - Use TDM `workgroupMask` for multicast of shared tiles after single-CTA TDM staging is correct.
+   - Use Triton's cluster-barrier lowering for cross-CTA phase alignment.
+   - Use TDM multicast for shared tiles after single-CTA TDM staging is correct.
 
 8. CUDA-parity gate plus persistent MoE launch
    - Keep the same boundary as the upstream CUDA path: gate/router launch first, persistent MoE launch second.

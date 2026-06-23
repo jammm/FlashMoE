@@ -18,7 +18,7 @@ Inside `forward`, blocks do not return after one tile. They stay resident and
 cooperate through global task queues, doorbells, and packet signals until the
 scheduler proves that all work for the forward pass has drained.
 
-The current CUDA-parity public flow still prepares routing metadata before the
+The current CUDA-parity flow still prepares routing metadata before the
 MoE launch. The megakernel consumes:
 
 - `expertCounts[E]`

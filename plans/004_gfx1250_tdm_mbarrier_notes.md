@@ -16,9 +16,9 @@ The TheRock ROCm install exposes a HIP TDM descriptor header for gfx1250:
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 ```
 
-The header provides packed descriptor groups such as `gfx1250_TDM_GROUP0` and
-`gfx1250_TDM_GROUP1`. The upstream HIP unit test added with the TDM support
-builds a descriptor, calls `__builtin_amdgcn_tensor_load_to_lds`, waits with
+The header exposes helpers used by upstream HIP tests for TDM load/store
+coverage. The upstream HIP unit test added with the TDM support builds a
+descriptor, calls `__builtin_amdgcn_tensor_load_to_lds`, waits with
 `__builtin_amdgcn_s_wait_tensorcnt(0)`, then calls
 `__builtin_amdgcn_tensor_store_from_lds`.
 
@@ -39,7 +39,7 @@ Triton confirms that gfx1250 has an mbarrier abstraction, but it is not an
 NVIDIA-style hardware mbarrier object. Triton lowers it to a 64-bit LDS state
 word plus AMD DS barrier atomics.
 
-Public lowering details:
+Lowering details:
 
 - The barrier allocation is one `i64` in LDS.
 - Triton's gfx1250 lowering initializes the LDS state from thread 0.
@@ -56,10 +56,9 @@ using named barriers to infer copy completion.
 ## TDM Completion via mbarrier
 
 Triton's TDM path accepts an optional `mbarrier` handle on async load, store,
-gather, and scatter. The lowering encodes that LDS barrier into TDM descriptor
-group 1 through the `TDMUtility.cpp` helpers. For split TDM instructions,
-Triton only attaches the barrier to the last generated instruction for that
-logical copy.
+gather, and scatter. The lowering attaches the LDS barrier to the TDM operation.
+For split TDM instructions, Triton only attaches the barrier to the last
+generated instruction for that logical copy.
 
 Consequences for FlashMoE:
 
@@ -95,7 +94,7 @@ The full gfx1250 megakernel should therefore use:
 
 ## Wave Clusters and Multicast
 
-Public gfx1250 HIP/Triton paths expose workgroup clusters. Use the HIP launch attributes and
+gfx1250 HIP/Triton paths expose workgroup clusters. Use the HIP launch attributes and
 Triton cluster-barrier lowering as the reference points.
 
 Relevant constraints and usage:
@@ -106,8 +105,8 @@ Relevant constraints and usage:
 - When a dispatch is not launched as a cluster, cluster-barrier instructions
   are NOPs.
 
-TDM multicast is controlled by the workgroup mask field in descriptor group 1.
-The public HIP/Triton path exposes this on tensor loads for clustered launches.
+The HIP/Triton path exposes TDM multicast on tensor loads for clustered
+launches.
 
 Consequences for FlashMoE:
 
@@ -116,7 +115,7 @@ Consequences for FlashMoE:
 - Query and validate the cluster shape at startup/test time before enabling a
   clustered production path.
 - Use Triton's cluster-barrier lowering to align CTAs within a wave cluster.
-- Use the TDM workgroup mask for multicast of shared expert/input tiles across
+- Use TDM multicast for shared expert/input tiles across
   cooperating CTAs.
 - Do not use LDS mbarriers for cross-CTA synchronization. They are local to one
   workgroup's LDS.
@@ -129,8 +128,8 @@ The Blackwell paper's TMA plus barrier pipeline maps to gfx1250 as:
 - TMA completion mbarrier -> gfx1250 LDS mbarrier encoded in the TDM descriptor.
 - Warp specialization barriers -> named workgroup barriers, only if explicit
   producer/consumer wave rendezvous is still needed after the mbarrier design.
-- CTA cluster multicast -> wave-cluster launch plus TDM workgroup mask.
-- CTA cluster synchronization -> public Triton cluster-barrier lowering.
+- CTA cluster multicast -> cluster launch plus TDM multicast.
+- CTA cluster synchronization -> Triton's cluster-barrier lowering.
 
 The immediate implementation path is:
 

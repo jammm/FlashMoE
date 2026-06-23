@@ -68,4 +68,4 @@ path. Full multi-GPU rocSHMEM behavior requires a multi-GPU environment.
 
 ## Implementation Implication
 
-The HIP branch now keeps the CUDA public execution contract: a standalone gate/router kernel computes `expertCounts` and `Context::tokenIndices`, then the persistent MoE kernel consumes that routing metadata. The persistent processor path uses in-kernel gfx1250 WMMA fragments with TDM-backed LDS staging, so GEMM0/GEMM1, activation, scheduling, and combine stay inside the MoE megakernel. Remaining work is performance tuning of the CUDA-parity gate path and multi-GPU rocSHMEM validation on a machine with more than one visible GPU.
+The HIP branch now keeps the CUDA execution contract: a standalone gate/router kernel computes `expertCounts` and `Context::tokenIndices`, then the persistent MoE kernel consumes that routing metadata. The persistent processor path uses in-kernel gfx1250 WMMA fragments with TDM-backed LDS staging, so GEMM0/GEMM1, activation, scheduling, and combine stay inside the MoE megakernel. Remaining work is performance tuning of the CUDA-parity gate path and multi-GPU rocSHMEM validation on a machine with more than one visible GPU.
