@@ -423,11 +423,13 @@ def _persistent_dispatch_moe_kernel(
 
 
 @gluon.jit
-def _persistent_tdm_wmma_top1_kernel(
+def _persistent_tdm_wmma_kernel(
     tokens,
     gate_weights,
     expert_up,
     bias_up,
+    expert_up_v,
+    bias_up_v,
     expert_down,
     bias_down,
     output,
@@ -444,6 +446,9 @@ def _persistent_tdm_wmma_top1_kernel(
     I: gl.constexpr,
     E: gl.constexpr,
     EC: gl.constexpr,
+    TOP_K: gl.constexpr,
+    ACTIVATION: gl.constexpr,
+    GATED: gl.constexpr,
     BLOCK_E: gl.constexpr,
     BLOCK_H: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -498,8 +503,10 @@ def _persistent_tdm_wmma_top1_kernel(
         zero_f = token_id.to(gl.float32) * 0.0
         zero_i = token_id * 0
 
-        top_idx = zero_i
-        top_logit = zero_f - float("inf")
+        top0_idx = zero_i
+        top1_idx = zero_i
+        top0_logit = zero_f - float("inf")
+        top1_logit = zero_f - float("inf")
         for expert_id in gl.static_range(0, BLOCK_E):
             if expert_id < E:
                 expert_id_t = zero_i + expert_id
@@ -508,15 +515,38 @@ def _persistent_tdm_wmma_top1_kernel(
                     t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                     w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                     logit += t * w
-                better = logit > top_logit
-                top_idx = gl.where(better, expert_id_t, top_idx)
-                top_logit = gl.where(better, logit, top_logit)
 
-        slot = gl.atomic_add(expert_counts + top_idx, 1, sem="relaxed", scope="gpu")
-        active = slot < EC
-        safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
-        gl.store(route_tokens + top_idx * EC + safe_slot, token_id, mask=active)
-        gl.store(route_probs + top_idx * EC + safe_slot, zero_f + 1.0, mask=active)
+                better0 = logit > top0_logit
+                better1 = (logit > top1_logit) & (logit <= top0_logit)
+                old_top0_idx = top0_idx
+                old_top0_logit = top0_logit
+
+                top1_idx = gl.where(better0, old_top0_idx, top1_idx)
+                top1_logit = gl.where(better0, old_top0_logit, top1_logit)
+                top0_idx = gl.where(better0, expert_id_t, top0_idx)
+                top0_logit = gl.where(better0, logit, top0_logit)
+
+                top1_idx = gl.where(better1, expert_id_t, top1_idx)
+                top1_logit = gl.where(better1, logit, top1_logit)
+
+        max_top = gl.maximum(top0_logit, top1_logit)
+        top0_exp = gl.exp(top0_logit - max_top)
+        top1_exp = gl.exp(top1_logit - max_top)
+        denom = top0_exp + top1_exp
+
+        for route_id in gl.static_range(0, 2):
+            if route_id < TOP_K:
+                expert_idx = gl.where(route_id == 0, top0_idx, top1_idx)
+                route_prob = zero_f + 1.0
+                if TOP_K == 2:
+                    route_exp = gl.where(route_id == 0, top0_exp, top1_exp)
+                    route_prob = route_exp / denom
+
+                slot = gl.atomic_add(expert_counts + expert_idx, 1, sem="relaxed", scope="gpu")
+                active = slot < EC
+                safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
+                gl.store(route_tokens + expert_idx * EC + safe_slot, token_id, mask=active)
+                gl.store(route_probs + expert_idx * EC + safe_slot, route_prob, mask=active)
 
         token_id += NUM_PROGRAMS
     _global_barrier(barriers, 1, NUM_PROGRAMS)
@@ -575,13 +605,32 @@ def _persistent_tdm_wmma_top1_kernel(
         offs_i = gl.arange(0, I, layout=bias_layout)
         bias = gl.load(bias_up + expert_idx * I + offs_i).to(gl.float32)
         acc += bias[None, :]
+        hidden_acc = _apply_activation(acc, ACTIVATION)
+
+        if GATED:
+            wv_desc = tdm.make_tensor_descriptor(
+                base=expert_up_v + expert_idx * H * I,
+                shape=(H, I),
+                strides=(I, 1),
+                block_shape=(H, I),
+                layout=shared_b_layout,
+            )
+            wv_smem = gl.allocate_shared_memory(expert_up_v.dtype.element_ty, shape=[H, I], layout=shared_b_layout)
+            tdm.async_load(wv_desc, [0, 0], wv_smem)
+            tdm.async_wait(0)
+            wv_frag = wv_smem.load(layout=dot_b)
+            acc_v = gl.zeros((BLOCK_M, I), dtype=gl.float32, layout=wmma_layout)
+            acc_v = gl.amd.gfx1250.wmma(x_frag, wv_frag, acc_v)
+            bias_v = gl.load(bias_up_v + expert_idx * I + offs_i).to(gl.float32)
+            acc_v += bias_v[None, :]
+            hidden_acc *= acc_v
 
         rows = base_slot + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, wmma_layout))
         cols = gl.arange(0, I, layout=gl.SliceLayout(0, wmma_layout))
         store_mask = rows[:, None] < gl.minimum(expert_count, expert_count * 0 + EC)
         gl.store(
             hidden + (expert_idx * EC + rows[:, None]) * I + cols[None, :],
-            acc,
+            hidden_acc,
             mask=store_mask,
         )
 
@@ -868,24 +917,19 @@ def forward_megakernel(
         barriers = torch.empty((6,), device=tokens.device, dtype=torch.int32)
         init_flag = torch.empty((1,), device=tokens.device, dtype=torch.int32)
         launch_epoch = random.randint(1, (1 << 30) - 1)
-        if (
-            use_tdm_wmma
-            and spec.top_k == 1
-            and spec.activation == ACT_IDENTITY
-            and not spec.gated
-            and spec.h == 64
-            and spec.i == 64
-        ):
+        if use_tdm_wmma and spec.top_k in (1, 2) and spec.h == 64 and spec.i == 64:
             hidden = torch.empty(
                 (spec.e, spec.expert_capacity, spec.i),
                 device=tokens.device,
                 dtype=tokens.dtype,
             )
-            _persistent_tdm_wmma_top1_kernel[(num_programs,)](
+            _persistent_tdm_wmma_kernel[(num_programs,)](
                 tokens,
                 gate_weights,
                 expert_up,
                 bias_up,
+                up_v_arg,
+                bias_up_v_arg,
                 expert_down,
                 bias_down,
                 out,
@@ -902,6 +946,9 @@ def forward_megakernel(
                 I=spec.i,
                 E=spec.e,
                 EC=spec.expert_capacity,
+                TOP_K=spec.top_k,
+                ACTIVATION=spec.activation,
+                GATED=spec.gated,
                 BLOCK_E=block_e,
                 BLOCK_H=spec.block_h,
                 BLOCK_M=16,
