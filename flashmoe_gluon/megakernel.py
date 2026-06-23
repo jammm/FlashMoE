@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -196,6 +197,207 @@ def _single_dispatch_top1_debug_kernel(
 
 
 @gluon.jit
+def _global_barrier(barriers, phase: gl.constexpr, NUM_PROGRAMS: gl.constexpr):
+    if NUM_PROGRAMS > 1:
+        gl.atomic_add(barriers + phase, 1, sem="release", scope="gpu")
+        while gl.atomic_cas(
+            barriers + phase,
+            NUM_PROGRAMS,
+            NUM_PROGRAMS,
+            sem="acquire",
+            scope="gpu",
+        ) < NUM_PROGRAMS:
+            pass
+
+
+@gluon.jit
+def _cluster_barrier(USE_WORKGROUP_CLUSTER: gl.constexpr):
+    if USE_WORKGROUP_CLUSTER:
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+
+
+@gluon.jit
+def _persistent_dispatch_moe_kernel(
+    tokens,
+    gate_weights,
+    expert_up,
+    bias_up,
+    expert_up_v,
+    bias_up_v,
+    expert_down,
+    bias_down,
+    output,
+    expert_counts,
+    route_tokens,
+    route_probs,
+    task_heads,
+    barriers,
+    init_flag,
+    launch_epoch,
+    S: gl.constexpr,
+    H: gl.constexpr,
+    I: gl.constexpr,
+    E: gl.constexpr,
+    EC: gl.constexpr,
+    TOP_K: gl.constexpr,
+    BLOCK_E: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    ACTIVATION: gl.constexpr,
+    GATED: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+    USE_WORKGROUP_CLUSTER: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    h_layout: gl.constexpr = _hidden_layout(NUM_WARPS)
+    offs_h = gl.arange(0, BLOCK_H, layout=h_layout)
+    h_mask = offs_h < H
+
+    if pid == 0:
+        for expert_id in gl.static_range(0, BLOCK_E):
+            if expert_id < E:
+                gl.store(expert_counts + expert_id, 0)
+        for phase in gl.static_range(0, 4):
+            gl.store(barriers + phase, 0)
+        gl.store(task_heads, 0)
+        if NUM_PROGRAMS > 1:
+            gl.atomic_xchg(init_flag, launch_epoch, sem="release", scope="gpu")
+        else:
+            gl.store(init_flag, launch_epoch)
+
+    if NUM_PROGRAMS > 1:
+        while gl.atomic_cas(
+            init_flag,
+            launch_epoch,
+            launch_epoch,
+            sem="acquire",
+            scope="gpu",
+        ) != launch_epoch:
+            pass
+        _cluster_barrier(USE_WORKGROUP_CLUSTER)
+
+    out_base = pid * BLOCK_H
+    while out_base < S * H:
+        gl.store(output + out_base + offs_h, gl.full((BLOCK_H,), 0.0, gl.float32, layout=h_layout),
+                 mask=out_base + offs_h < S * H)
+        out_base += NUM_PROGRAMS * BLOCK_H
+    _global_barrier(barriers, 0, NUM_PROGRAMS)
+
+    token_id = pid
+    while token_id < S:
+        zero_f = token_id.to(gl.float32) * 0.0
+        zero_i = token_id * 0
+
+        top0_idx = zero_i
+        top1_idx = zero_i
+        top0_logit = zero_f - float("inf")
+        top1_logit = zero_f - float("inf")
+
+        for expert_id in gl.static_range(0, BLOCK_E):
+            if expert_id < E:
+                expert_id_t = zero_i + expert_id
+                logit = zero_f
+                for h_abs in gl.static_range(0, H):
+                    t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
+                    w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
+                    logit += t * w
+
+                better0 = logit > top0_logit
+                better1 = (logit > top1_logit) & (logit <= top0_logit)
+                old_top0_idx = top0_idx
+                old_top0_logit = top0_logit
+
+                top1_idx = gl.where(better0, old_top0_idx, top1_idx)
+                top1_logit = gl.where(better0, old_top0_logit, top1_logit)
+                top0_idx = gl.where(better0, expert_id_t, top0_idx)
+                top0_logit = gl.where(better0, logit, top0_logit)
+
+                top1_idx = gl.where(better1, expert_id_t, top1_idx)
+                top1_logit = gl.where(better1, logit, top1_logit)
+
+        max_top = gl.maximum(top0_logit, top1_logit)
+        top0_exp = gl.exp(top0_logit - max_top)
+        top1_exp = gl.exp(top1_logit - max_top)
+        denom = top0_exp + top1_exp
+
+        for route_id in gl.static_range(0, 2):
+            if route_id < TOP_K:
+                expert_idx = gl.where(route_id == 0, top0_idx, top1_idx)
+                route_prob = zero_f + 1.0
+                if TOP_K == 2:
+                    route_exp = gl.where(route_id == 0, top0_exp, top1_exp)
+                    route_prob = route_exp / denom
+
+                slot = gl.atomic_add(expert_counts + expert_idx, 1, sem="relaxed", scope="gpu")
+                active = slot < EC
+                safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
+                gl.store(route_tokens + expert_idx * EC + safe_slot, token_id, mask=active)
+                gl.store(route_probs + expert_idx * EC + safe_slot, route_prob, mask=active)
+
+        token_id += NUM_PROGRAMS
+    _global_barrier(barriers, 1, NUM_PROGRAMS)
+
+    if pid == 0:
+        gl.store(task_heads, 0)
+    _global_barrier(barriers, 2, NUM_PROGRAMS)
+
+    task_id = gl.atomic_add(task_heads, 1, sem="relaxed", scope="gpu")
+    while task_id < E * EC:
+        expert_idx = task_id // EC
+        slot = task_id - expert_idx * EC
+        expert_count = gl.load(expert_counts + expert_idx)
+        active = slot < gl.minimum(expert_count, expert_count * 0 + EC)
+        routed_token = gl.load(route_tokens + expert_idx * EC + slot, mask=active, other=0)
+        route_prob = gl.load(route_probs + expert_idx * EC + slot, mask=active, other=0.0).to(gl.float32)
+
+        route_vals = gl.load(
+            bias_down + expert_idx * H + offs_h,
+            mask=h_mask,
+            other=0.0,
+        ).to(gl.float32)
+
+        for i_abs in gl.static_range(0, I):
+            up_acc = gl.load(bias_up + expert_idx * I + i_abs).to(gl.float32)
+            for h_abs in gl.static_range(0, H):
+                t = gl.load(tokens + routed_token * H + h_abs, mask=active, other=0.0).to(gl.float32)
+                wu = gl.load(
+                    expert_up + expert_idx * H * I + h_abs * I + i_abs
+                ).to(gl.float32)
+                up_acc += t * wu
+
+            hidden = _apply_activation(up_acc, ACTIVATION)
+            if GATED:
+                v_acc = gl.load(bias_up_v + expert_idx * I + i_abs).to(gl.float32)
+                for h_abs in gl.static_range(0, H):
+                    t = gl.load(tokens + routed_token * H + h_abs, mask=active, other=0.0).to(gl.float32)
+                    wv = gl.load(
+                        expert_up_v + expert_idx * H * I + h_abs * I + i_abs
+                    ).to(gl.float32)
+                    v_acc += t * wv
+                hidden *= v_acc
+
+            wd = gl.load(
+                expert_down + expert_idx * I * H + i_abs * H + offs_h,
+                mask=h_mask,
+                other=0.0,
+            ).to(gl.float32)
+            route_vals += hidden * wd
+
+        gl.atomic_add(
+            output + routed_token * H + offs_h,
+            route_prob * route_vals,
+            sem="relaxed",
+            scope="gpu",
+            mask=active & h_mask,
+        )
+
+        task_id = gl.atomic_add(task_heads, 1, sem="relaxed", scope="gpu")
+
+    _global_barrier(barriers, 3, NUM_PROGRAMS)
+
+
+@gluon.jit
 def _single_dispatch_moe_kernel(
     tokens,
     gate_weights,
@@ -368,6 +570,11 @@ def forward_megakernel(
     swish_beta: float = 1.0,
     block_h: Optional[int] = None,
     num_warps: int = 4,
+    num_programs: int = 2,
+    num_ctas: int = 1,
+    use_workgroup_cluster: bool = False,
+    launch_cooperative_grid: bool = False,
+    use_persistent: bool = True,
     return_counts: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del swish_alpha, swish_beta
@@ -386,12 +593,69 @@ def forward_megakernel(
         block_h=block_h,
         num_warps=num_warps,
     )
-    if return_counts:
-        raise NotImplementedError("Gluon paper-parity megakernel has not wired count return yet")
+    if num_programs <= 0:
+        raise ValueError("num_programs must be positive")
+    if num_ctas <= 0:
+        raise ValueError("num_ctas must be positive")
+    if use_workgroup_cluster and num_ctas == 1:
+        raise ValueError("use_workgroup_cluster requires num_ctas > 1")
+    if use_workgroup_cluster:
+        raise NotImplementedError(
+            "workgroup-cluster execution is not enabled for the scalar persistent body yet"
+        )
     block_e = max(16, _next_power_of_2(spec.e))
     up_v_arg = expert_up_v if expert_up_v is not None else expert_up
     bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
     out = torch.empty((spec.s, spec.h), device=tokens.device, dtype=torch.float32)
+
+    if use_persistent:
+        expert_counts = torch.empty((spec.e,), device=tokens.device, dtype=torch.int32)
+        route_tokens = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.int32)
+        route_probs = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.float32)
+        task_heads = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+        barriers = torch.empty((4,), device=tokens.device, dtype=torch.int32)
+        init_flag = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+        launch_epoch = random.randint(1, (1 << 30) - 1)
+        _persistent_dispatch_moe_kernel[(num_programs,)](
+            tokens,
+            gate_weights,
+            expert_up,
+            bias_up,
+            up_v_arg,
+            bias_up_v_arg,
+            expert_down,
+            bias_down,
+            out,
+            expert_counts,
+            route_tokens,
+            route_probs,
+            task_heads,
+            barriers,
+            init_flag,
+            launch_epoch,
+            S=spec.s,
+            H=spec.h,
+            I=spec.i,
+            E=spec.e,
+            EC=spec.expert_capacity,
+            TOP_K=spec.top_k,
+            BLOCK_E=block_e,
+            BLOCK_H=spec.block_h,
+            ACTIVATION=spec.activation,
+            GATED=spec.gated,
+            NUM_PROGRAMS=num_programs,
+            USE_WORKGROUP_CLUSTER=use_workgroup_cluster,
+            NUM_WARPS=spec.num_warps,
+            num_warps=spec.num_warps,
+            num_ctas=num_ctas,
+            launch_cooperative_grid=launch_cooperative_grid,
+        )
+        if return_counts:
+            return out, expert_counts
+        return out
+
+    if return_counts:
+        raise NotImplementedError("count return is only available for the persistent Gluon megakernel")
     _single_dispatch_moe_kernel[(spec.s,)](
         tokens,
         gate_weights,
