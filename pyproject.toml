@@ -27,7 +27,7 @@ Homepage = "https://github.com/osayamenja/FlashMoE"
 Repository = "https://github.com/osayamenja/FlashMoE"
 
 [tool.setuptools]
-packages = ["flashmoe"]
+packages = ["flashmoe", "flashmoe_hip", "flashmoe_triton", "flashmoe_gluon"]
 
 [tool.setuptools.package-data]
 flashmoe = [
