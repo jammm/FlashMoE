@@ -9,6 +9,7 @@ from .megakernel import (
     forward_scalar_top1_debug,
 )
 from .gfx1250_backend import backend_status, load_moe_backend
+from .staging import build_routing_metadata, forward_decomposed_staging
 
 __all__ = [
     "ACT_IDENTITY",
@@ -18,5 +19,7 @@ __all__ = [
     "forward_megakernel",
     "forward_scalar_top1_debug",
     "backend_status",
+    "build_routing_metadata",
+    "forward_decomposed_staging",
     "load_moe_backend",
 ]

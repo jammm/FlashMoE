@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--backend-status", action="store_true")
     parser.add_argument("--no-run", action="store_true")
     parser.add_argument("--allow-scalar-debug", action="store_true")
+    parser.add_argument("--allow-decomposed-staging", action="store_true")
     args = parser.parse_args()
 
     if args.backend_status or args.no_run:
@@ -64,6 +65,17 @@ def main() -> None:
             down.cuda(),
             bias_up.cuda(),
             bias_down.cuda(),
+            expert_capacity=args.expert_capacity,
+        )
+    elif args.allow_decomposed_staging:
+        out = fmg.forward_decomposed_staging(
+            tokens.cuda(),
+            gate.cuda(),
+            up.cuda(),
+            down.cuda(),
+            bias_up.cuda(),
+            bias_down.cuda(),
+            top_k=args.top_k,
             expert_capacity=args.expert_capacity,
         )
     else:
