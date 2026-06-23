@@ -21,6 +21,7 @@ class ContextHandle:
 
 class Topology(IntEnum):
     XGMI_ONLY = 0   # all peers on XGMI (equivalent to NVLINK_ONLY)
+    NVLINK_ONLY = 0
     MIXED = 1
 
 class MLPType(IntEnum):

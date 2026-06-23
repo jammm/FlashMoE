@@ -34,3 +34,6 @@ flashmoe = [
     "CMakeLists.txt",
     "cmake/*"
 ]
+flashmoe_hip = [
+    "CMakeLists.txt"
+]

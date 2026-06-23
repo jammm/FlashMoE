@@ -21,6 +21,7 @@ class ContextHandle:
 
 class Topology(IntEnum):
     NVLINK_ONLY = 0
+    XGMI_ONLY = 0
     MIXED = 1
 
 class MLPType(IntEnum):
