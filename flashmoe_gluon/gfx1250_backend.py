@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import sys
 from dataclasses import dataclass
@@ -80,7 +81,54 @@ def load_moe_backend(triton_root: Optional[Path | str] = None) -> ModuleType:
     _prepend_once(python_path)
     _prepend_once(examples_path)
     _prepend_once(triton_kernels_path)
-    return importlib.import_module(_MOE_MODULE)
+    module = importlib.import_module(_MOE_MODULE)
+    _patch_moe_backend(module)
+    return module
+
+
+def _patch_moe_backend(module: ModuleType) -> None:
+    if getattr(module, "_flashmoe_compat_patched", False):
+        return
+
+    make_opt_flags = getattr(module, "make_opt_flags", None)
+    if make_opt_flags is not None:
+        params = inspect.signature(make_opt_flags).parameters
+        intermediate = params.get("intermediate_out_dtype")
+        if intermediate is not None and intermediate.default is inspect.Parameter.empty:
+            import torch
+
+            original_make_opt_flags = make_opt_flags
+
+            def make_opt_flags_compat(*args: Any, **kwargs: Any) -> Any:
+                if "intermediate_out_dtype" not in kwargs:
+                    precision_config = args[3]
+                    kwargs["intermediate_out_dtype"] = (
+                        getattr(precision_config, "intermediate_out_dtype", None) or torch.float32
+                    )
+                return original_make_opt_flags(*args, **kwargs)
+
+            module.make_opt_flags = make_opt_flags_compat
+
+    init_allocation = getattr(module, "init_allocation", None)
+    if init_allocation is not None:
+        params = inspect.signature(init_allocation).parameters
+        intermediate = params.get("intermediate_out_dtype")
+        if intermediate is not None and intermediate.default is inspect.Parameter.empty:
+            import torch
+
+            original_init_allocation = init_allocation
+
+            def init_allocation_compat(*args: Any, **kwargs: Any) -> Any:
+                if "intermediate_out_dtype" not in kwargs:
+                    precision_config = args[2]
+                    kwargs["intermediate_out_dtype"] = (
+                        getattr(precision_config, "intermediate_out_dtype", None) or torch.float32
+                    )
+                return original_init_allocation(*args, **kwargs)
+
+            module.init_allocation = init_allocation_compat
+
+    module._flashmoe_compat_patched = True
 
 
 def backend_status(triton_root: Optional[Path | str] = None) -> BackendStatus:

@@ -19,6 +19,10 @@ class RoutingMetadata:
     top_idx: torch.Tensor
 
 
+def _column_major_last2(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.transpose(-1, -2).contiguous().transpose(-1, -2)
+
+
 def build_routing_metadata(
     tokens: torch.Tensor,
     gate_weights: torch.Tensor,
@@ -110,6 +114,8 @@ def forward_decomposed_staging(
         expert_capacity=expert_capacity,
     )
     module = gfx1250_backend.load_moe_backend()
+    expert_up_cm = _column_major_last2(expert_up)
+    expert_down_cm = _column_major_last2(expert_down)
     matmul_kwargs = dict(
         num_buffers=num_buffers,
         block_m=block_m,
@@ -122,16 +128,16 @@ def forward_decomposed_staging(
 
     hidden, _ = module.matmul(
         tokens,
-        expert_up,
-        bias_up,
+        expert_up_cm,
+        bias_up.float(),
         routing.ragged_metadata,
         gather_indx=routing.gather_idx,
         **matmul_kwargs,
     )
     combined_rows, _ = module.matmul(
         hidden,
-        expert_down,
-        bias_down,
+        expert_down_cm,
+        bias_down.float(),
         routing.ragged_metadata,
         scatter_indx=routing.scatter_idx,
         **matmul_kwargs,
