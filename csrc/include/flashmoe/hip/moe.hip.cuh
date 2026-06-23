@@ -10,7 +10,8 @@
  *
  * Key changes from CUDA version:
  * - Uses HIP runtime instead of CUDA
- * - Replaces __grid_constant__ (not supported in HIP) with regular const
+ * - Passes device-resident argument blocks to avoid scalarizing large by-value
+ *   kernel argument structs
  * - Uses flashmoe::WARP_SIZE from constants.hpp (32 on MI450/gfx1250)
  * - Replaces cuda::std:: with std:: via cuda_compat.hpp mappings
  * - Uses hipMemsetAsync instead of cudaMemsetAsync
@@ -274,6 +275,16 @@ void checkAlignment(const void* const& p, const bool supports32) {
         std::terminate();
 #endif
     }
+}
+
+__host__ __forceinline__
+bool checkHipHostCall(const hipError_t err, const char* const what) {
+    if (err == hipSuccess) {
+        return true;
+    }
+    fprintf(stderr, "[FlashMoE] %s FAILED: %s (%s)\n",
+            what, hipGetErrorName(err), hipGetErrorString(err));
+    return false;
 }
 
 /**
@@ -673,9 +684,10 @@ void start(cuda::std::byte* __restrict__ const& workspace, const int* __restrict
  *   topo   - Network topology (NVLINK_ONLY or MIXED)
  *
  * Note for HIP port:
- *   - __grid_constant__ is not supported in HIP; using regular const parameters
- *   - __launch_bounds__ syntax is the same in HIP
- *   - WARP_SIZE from constants.hpp is 32 on MI450/gfx1250
+ *   - KernelArgs and Context are staged in device memory before launch so the
+ *     kernel does not receive large by-value kernarg structs.
+ *   - __launch_bounds__ syntax is the same in HIP.
+ *   - WARP_SIZE from constants.hpp is 32 on MI450/gfx1250.
  */
 template <
     typename Config,
@@ -683,7 +695,10 @@ template <
     Topology topo
 >
 __launch_bounds__(Config::Threads::value, 1)
-__global__ void forward(const KernelArgs kArgs, const Context ctx) {
+__global__ void forward(const KernelArgs* __restrict__ kArgsPtr,
+                        const Context* __restrict__ ctxPtr) {
+    const KernelArgs& kArgs = *kArgsPtr;
+    const Context& ctx = *ctxPtr;
     using DataType = typename Config::DType;
 
     extern __shared__ __align__(MAX_ALIGNMENT) cuda::std::byte flashWorkspace[];
@@ -812,7 +827,11 @@ template <
     Activation a
 >
 __host__ __forceinline__
-void forwardHost(const KernelArgs& kArgs, const Context& ctx, hipStream_t stream) {
+void forwardHostDeviceArgs(const KernelArgs& kArgs,
+                           const KernelArgs* deviceKArgs,
+                           const Context& ctx,
+                           const Context* deviceCtx,
+                           hipStream_t stream) {
     if constexpr (static_cast<CombineMode>(Config::CM::value) == CombineMode::plural) {
         const hipError_t err = hipMemsetAsync(
             kArgs.moeOut, 0,
@@ -824,12 +843,46 @@ void forwardHost(const KernelArgs& kArgs, const Context& ctx, hipStream_t stream
         }
     }
 
-    forward<Config, a, topo><<<ctx.blocks, Config::Threads::value, ctx.smemSize, stream>>>(kArgs, ctx);
+    forward<Config, a, topo>
+        <<<ctx.blocks, Config::Threads::value, ctx.smemSize, stream>>>(deviceKArgs, deviceCtx);
     hipError_t launchErr = hipPeekAtLastError();
     if (launchErr != hipSuccess) {
         fprintf(stderr, "[FlashMoE] Kernel launch FAILED: %s (%s)\n",
                hipGetErrorName(launchErr), hipGetErrorString(launchErr));
     }
+}
+
+template <
+    typename Config,
+    Topology topo,
+    Activation a
+>
+__host__ __forceinline__
+void forwardHost(const KernelArgs& kArgs, const Context& ctx, hipStream_t stream) {
+    KernelArgs* deviceKArgs = nullptr;
+    Context* deviceCtx = nullptr;
+    if (!checkHipHostCall(hipMallocAsync(&deviceKArgs, sizeof(KernelArgs), stream),
+                          "hipMallocAsync KernelArgs")) {
+        return;
+    }
+    if (!checkHipHostCall(hipMallocAsync(&deviceCtx, sizeof(Context), stream),
+                          "hipMallocAsync Context")) {
+        checkHipHostCall(hipFreeAsync(deviceKArgs, stream), "hipFreeAsync KernelArgs");
+        return;
+    }
+    if (!checkHipHostCall(hipMemcpyAsync(deviceKArgs, &kArgs, sizeof(KernelArgs),
+                                         hipMemcpyHostToDevice, stream),
+                          "hipMemcpyAsync KernelArgs") ||
+        !checkHipHostCall(hipMemcpyAsync(deviceCtx, &ctx, sizeof(Context),
+                                         hipMemcpyHostToDevice, stream),
+                          "hipMemcpyAsync Context")) {
+        checkHipHostCall(hipFreeAsync(deviceKArgs, stream), "hipFreeAsync KernelArgs");
+        checkHipHostCall(hipFreeAsync(deviceCtx, stream), "hipFreeAsync Context");
+        return;
+    }
+    forwardHostDeviceArgs<Config, topo, a>(kArgs, deviceKArgs, ctx, deviceCtx, stream);
+    checkHipHostCall(hipFreeAsync(deviceKArgs, stream), "hipFreeAsync KernelArgs");
+    checkHipHostCall(hipFreeAsync(deviceCtx, stream), "hipFreeAsync Context");
 }
 
 /**
@@ -864,8 +917,25 @@ void forwardHostBench(const KernelArgs& kArgs, Context& ctx, const uint& sharedS
         }
     }
 
-    // Launch kernel
-    forward<Config, a, topo><<<blocks, Config::Threads::value, sharedSize, stream>>>(kArgs, ctx);
+    KernelArgs* deviceKArgs = nullptr;
+    Context* deviceCtx = nullptr;
+    if (!checkHipHostCall(hipMallocAsync(&deviceKArgs, sizeof(KernelArgs), stream),
+                          "hipMallocAsync KernelArgs") ||
+        !checkHipHostCall(hipMallocAsync(&deviceCtx, sizeof(Context), stream),
+                          "hipMallocAsync Context") ||
+        !checkHipHostCall(hipMemcpyAsync(deviceKArgs, &kArgs, sizeof(KernelArgs),
+                                         hipMemcpyHostToDevice, stream),
+                          "hipMemcpyAsync KernelArgs") ||
+        !checkHipHostCall(hipMemcpyAsync(deviceCtx, &ctx, sizeof(Context),
+                                         hipMemcpyHostToDevice, stream),
+                          "hipMemcpyAsync Context")) {
+        if (deviceKArgs) checkHipHostCall(hipFreeAsync(deviceKArgs, stream), "hipFreeAsync KernelArgs");
+        if (deviceCtx) checkHipHostCall(hipFreeAsync(deviceCtx, stream), "hipFreeAsync Context");
+        return;
+    }
+    forward<Config, a, topo><<<blocks, Config::Threads::value, sharedSize, stream>>>(deviceKArgs, deviceCtx);
+    checkHipHostCall(hipFreeAsync(deviceKArgs, stream), "hipFreeAsync KernelArgs");
+    checkHipHostCall(hipFreeAsync(deviceCtx, stream), "hipFreeAsync Context");
 
     // Synchronize to ensure completion (for benchmarking)
     hipError_t err2 = hipStreamSynchronize(stream);

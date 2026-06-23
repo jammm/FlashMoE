@@ -66,6 +66,12 @@ using GEMM0Tile = cute::Shape<cute::Int<bM>, cute::Int<bN0>, cute::Int<bK0>, cut
 using GEMM1Tile = cute::Shape<cute::Int<bM>, cute::Int<bN1>, cute::Int<bK1>, cute::Int<pSK1>>;
 using Config = flashmoe::moe::MoEConfig<Element, Arch, threads, cm, mt, GEMM0Tile, GEMM1Tile>;
 
+struct MoEHandle {
+  flashmoe::Context ctx;
+  flashmoe::moe::KernelArgs* deviceKernelArgs = nullptr;
+  flashmoe::Context* deviceCtx = nullptr;
+};
+
 static std::uintptr_t moe_initialize(const size_t& numExperts, const size_t& EC,
   const int& epWorld, const int& myPE, const int& epRank, const int& devId, const int& nLx,
   const std::vector<int>& expertToEpRank, const std::vector<int> &epRankToGlobalRank,
@@ -76,6 +82,11 @@ static std::uintptr_t moe_initialize(const size_t& numExperts, const size_t& EC,
   }
   if (epRankToGlobalRank.size() != epWorld) {
     throw std::invalid_argument("rank map size should be == epWorld");
+  }
+  for (const int expertRank : expertToEpRank) {
+    if (expertRank < 0 || expertRank >= epWorld) {
+      throw std::invalid_argument("expert map contains an ep rank outside [0, epWorld)");
+    }
   }
 
   auto kernel = flashmoe::moe::forward<Config, act, topo>;
@@ -106,8 +117,12 @@ static std::uintptr_t moe_initialize(const size_t& numExperts, const size_t& EC,
     topo
   };
   const auto moeContext = flashmoe::initialize(args, Arch, expertToEpRank.data(), epRankToGlobalRank.data(), stream);
-  auto* heapCtx = new flashmoe::Context(moeContext);
-  return reinterpret_cast<std::uintptr_t>(heapCtx);
+  auto* handle = new MoEHandle{moeContext};
+  CHECK_HIP(hipMallocAsync(&handle->deviceKernelArgs, sizeof(flashmoe::moe::KernelArgs), stream));
+  CHECK_HIP(hipMallocAsync(&handle->deviceCtx, sizeof(flashmoe::Context), stream));
+  CHECK_HIP(hipMemcpyAsync(handle->deviceCtx, &handle->ctx, sizeof(flashmoe::Context),
+                           hipMemcpyHostToDevice, stream));
+  return reinterpret_cast<std::uintptr_t>(handle);
 }
 
 static void moe_forward(const std::uintptr_t& raw_ctx,
@@ -122,9 +137,9 @@ static void moe_forward(const std::uintptr_t& raw_ctx,
   const std::uintptr_t& moeOut,
   const float& swishAlpha, const float& swishBeta,
   const std::uintptr_t& stream_ptr) {
-  const auto* ctx = reinterpret_cast<flashmoe::Context*>(raw_ctx);
+  auto* handle = reinterpret_cast<MoEHandle*>(raw_ctx);
   auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
-  if (!ctx) {
+  if (!handle) {
     throw std::runtime_error("Invalid context");
   }
   constexpr auto isGated = mt == flashmoe::MLPMatmulType::gated;
@@ -140,19 +155,24 @@ static void moe_forward(const std::uintptr_t& raw_ctx,
     S, H, I, E, EC, Arch, mt, bM, isGated ? swishAlpha : 1.f, isGated ? swishBeta : 1.f, false
   };
 
-  flashmoe::moe::forwardHost<Config, topo, act>(kArgs, *ctx, stream);
+  CHECK_HIP(hipMemcpyAsync(handle->deviceKernelArgs, &kArgs, sizeof(kArgs),
+                           hipMemcpyHostToDevice, stream));
+  flashmoe::moe::forwardHostDeviceArgs<Config, topo, act>(
+      kArgs, handle->deviceKernelArgs, handle->ctx, handle->deviceCtx, stream);
 }
 
 static std::uintptr_t get_token_indices(const std::uintptr_t& raw_ctx) {
-  return reinterpret_cast<std::uintptr_t>(reinterpret_cast<flashmoe::Context*>(raw_ctx)->tokenIndices);
+  return reinterpret_cast<std::uintptr_t>(reinterpret_cast<MoEHandle*>(raw_ctx)->ctx.tokenIndices);
 }
 
 static void moe_finalize(const std::uintptr_t& raw_ctx, const std::uintptr_t& stream_ptr) {
-  const auto* ctx = reinterpret_cast<flashmoe::Context*>(raw_ctx);
+  auto* handle = reinterpret_cast<MoEHandle*>(raw_ctx);
   auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
-  if (!ctx) return;
-  flashmoe::finalize(*ctx, stream);
-  delete ctx;
+  if (!handle) return;
+  CHECK_HIP(hipFreeAsync(handle->deviceKernelArgs, stream));
+  CHECK_HIP(hipFreeAsync(handle->deviceCtx, stream));
+  flashmoe::finalize(handle->ctx, stream);
+  delete handle;
 }
 
 PYBIND11_MODULE($mod_name, m) {
