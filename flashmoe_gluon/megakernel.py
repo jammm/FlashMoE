@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from triton.experimental.gluon.language.amd.gfx1250 import tdm
 
 
 ACT_IDENTITY = 0
@@ -123,6 +124,30 @@ def _validate_common(
 @gluon.constexpr_function
 def _hidden_layout(num_warps):
     return gl.BlockedLayout([1], [32], [num_warps], [0])
+
+
+@gluon.constexpr_function
+def _wmma_layout(num_warps):
+    if num_warps == 4:
+        warp_bases = [[0, 1], [1, 0]]
+    else:
+        warp_bases = [[0, 1], [0, 2], [1, 0]]
+    return gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 32])
+
+
+@gluon.constexpr_function
+def _wmma_shared_a_layout(block_m, block_k):
+    return gl.PaddedSharedLayout.with_identity_for([[block_k, 8]], [block_m, block_k], [1, 0])
+
+
+@gluon.constexpr_function
+def _wmma_shared_b_layout(block_k, block_n):
+    return gl.PaddedSharedLayout.with_identity_for([[block_n, 16]], [block_k, block_n], [1, 0])
+
+
+@gluon.constexpr_function
+def _route_index_layout(block_m, num_warps):
+    return gl.BlockedLayout([block_m, 1], [1, 32], [1, num_warps], [1, 0])
 
 
 @gluon.jit
@@ -398,6 +423,232 @@ def _persistent_dispatch_moe_kernel(
 
 
 @gluon.jit
+def _persistent_tdm_wmma_top1_kernel(
+    tokens,
+    gate_weights,
+    expert_up,
+    bias_up,
+    expert_down,
+    bias_down,
+    output,
+    hidden,
+    expert_counts,
+    route_tokens,
+    route_probs,
+    task_heads,
+    barriers,
+    init_flag,
+    launch_epoch,
+    S: gl.constexpr,
+    H: gl.constexpr,
+    I: gl.constexpr,
+    E: gl.constexpr,
+    EC: gl.constexpr,
+    BLOCK_E: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    gl.static_assert(H == 64, "TDM/WMMA path currently expects H=64")
+    gl.static_assert(I == 64, "TDM/WMMA path currently expects I=64")
+    gl.static_assert(BLOCK_M == 16, "TDM/WMMA path currently expects BLOCK_M=16")
+    gl.static_assert(BLOCK_N == 64, "TDM/WMMA path currently expects BLOCK_N=64")
+
+    pid = gl.program_id(0)
+    h_layout: gl.constexpr = _hidden_layout(NUM_WARPS)
+    offs_h = gl.arange(0, BLOCK_H, layout=h_layout)
+    h_mask = offs_h < H
+
+    if pid == 0:
+        for expert_id in gl.static_range(0, BLOCK_E):
+            if expert_id < E:
+                gl.store(expert_counts + expert_id, 0)
+        for phase in gl.static_range(0, 6):
+            gl.store(barriers + phase, 0)
+        gl.store(task_heads, 0)
+        if NUM_PROGRAMS > 1:
+            gl.atomic_xchg(init_flag, launch_epoch, sem="release", scope="gpu")
+        else:
+            gl.store(init_flag, launch_epoch)
+
+    if NUM_PROGRAMS > 1:
+        while gl.atomic_cas(
+            init_flag,
+            launch_epoch,
+            launch_epoch,
+            sem="acquire",
+            scope="gpu",
+        ) != launch_epoch:
+            pass
+
+    out_base = pid * BLOCK_H
+    while out_base < S * H:
+        gl.store(
+            output + out_base + offs_h,
+            gl.full((BLOCK_H,), 0.0, gl.float32, layout=h_layout),
+            mask=out_base + offs_h < S * H,
+        )
+        out_base += NUM_PROGRAMS * BLOCK_H
+    _global_barrier(barriers, 0, NUM_PROGRAMS)
+
+    token_id = pid
+    while token_id < S:
+        zero_f = token_id.to(gl.float32) * 0.0
+        zero_i = token_id * 0
+
+        top_idx = zero_i
+        top_logit = zero_f - float("inf")
+        for expert_id in gl.static_range(0, BLOCK_E):
+            if expert_id < E:
+                expert_id_t = zero_i + expert_id
+                logit = zero_f
+                for h_abs in gl.static_range(0, H):
+                    t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
+                    w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
+                    logit += t * w
+                better = logit > top_logit
+                top_idx = gl.where(better, expert_id_t, top_idx)
+                top_logit = gl.where(better, logit, top_logit)
+
+        slot = gl.atomic_add(expert_counts + top_idx, 1, sem="relaxed", scope="gpu")
+        active = slot < EC
+        safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
+        gl.store(route_tokens + top_idx * EC + safe_slot, token_id, mask=active)
+        gl.store(route_probs + top_idx * EC + safe_slot, zero_f + 1.0, mask=active)
+
+        token_id += NUM_PROGRAMS
+    _global_barrier(barriers, 1, NUM_PROGRAMS)
+
+    if pid == 0:
+        gl.store(task_heads, 0)
+    _global_barrier(barriers, 2, NUM_PROGRAMS)
+
+    wmma_layout: gl.constexpr = _wmma_layout(NUM_WARPS)
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    shared_a_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, H)
+    shared_b_layout: gl.constexpr = _wmma_shared_b_layout(H, I)
+    route_layout: gl.constexpr = _route_index_layout(BLOCK_M, NUM_WARPS)
+    route_offs = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, route_layout))
+
+    route_blocks: gl.constexpr = (EC + BLOCK_M - 1) // BLOCK_M
+    task_id = gl.atomic_add(task_heads, 1, sem="relaxed", scope="gpu")
+    while task_id < E * route_blocks:
+        expert_idx = task_id // route_blocks
+        route_block = task_id - expert_idx * route_blocks
+        base_slot = route_block * BLOCK_M
+        expert_count = gl.load(expert_counts + expert_idx)
+        active_rows = base_slot + route_offs < gl.minimum(expert_count, expert_count * 0 + EC)
+        gathered_tokens = gl.load(
+            route_tokens + expert_idx * EC + base_slot + route_offs,
+            mask=active_rows,
+            other=0,
+        ).to(gl.int32)
+
+        x_desc = tdm.make_tensor_descriptor(
+            base=tokens,
+            shape=(S, H),
+            strides=(H, 1),
+            block_shape=(BLOCK_M, H),
+            layout=shared_a_layout,
+        )
+        w_desc = tdm.make_tensor_descriptor(
+            base=expert_up + expert_idx * H * I,
+            shape=(H, I),
+            strides=(I, 1),
+            block_shape=(H, I),
+            layout=shared_b_layout,
+        )
+        x_smem = gl.allocate_shared_memory(tokens.dtype.element_ty, shape=[BLOCK_M, H], layout=shared_a_layout)
+        w_smem = gl.allocate_shared_memory(expert_up.dtype.element_ty, shape=[H, I], layout=shared_b_layout)
+        tdm.async_gather(x_desc, gathered_tokens, x_smem)
+        tdm.async_load(w_desc, [0, 0], w_smem)
+        tdm.async_wait(0)
+        x_frag = x_smem.load(layout=dot_a)
+        w_frag = w_smem.load(layout=dot_b)
+        acc = gl.zeros((BLOCK_M, I), dtype=gl.float32, layout=wmma_layout)
+        acc = gl.amd.gfx1250.wmma(x_frag, w_frag, acc)
+
+        bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
+        offs_i = gl.arange(0, I, layout=bias_layout)
+        bias = gl.load(bias_up + expert_idx * I + offs_i).to(gl.float32)
+        acc += bias[None, :]
+
+        rows = base_slot + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, wmma_layout))
+        cols = gl.arange(0, I, layout=gl.SliceLayout(0, wmma_layout))
+        store_mask = rows[:, None] < gl.minimum(expert_count, expert_count * 0 + EC)
+        gl.store(
+            hidden + (expert_idx * EC + rows[:, None]) * I + cols[None, :],
+            acc,
+            mask=store_mask,
+        )
+
+        task_id = gl.atomic_add(task_heads, 1, sem="relaxed", scope="gpu")
+
+    _global_barrier(barriers, 3, NUM_PROGRAMS)
+    if pid == 0:
+        gl.store(task_heads, 0)
+    _global_barrier(barriers, 4, NUM_PROGRAMS)
+
+    shared_h_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, I)
+    shared_down_layout: gl.constexpr = _wmma_shared_b_layout(I, H)
+    task_id = gl.atomic_add(task_heads, 1, sem="relaxed", scope="gpu")
+    while task_id < E * route_blocks:
+        expert_idx = task_id // route_blocks
+        route_block = task_id - expert_idx * route_blocks
+        base_slot = route_block * BLOCK_M
+        expert_count = gl.load(expert_counts + expert_idx)
+
+        h_desc = tdm.make_tensor_descriptor(
+            base=hidden + expert_idx * EC * I + base_slot * I,
+            shape=(EC, I),
+            strides=(I, 1),
+            block_shape=(BLOCK_M, I),
+            layout=shared_h_layout,
+        )
+        down_desc = tdm.make_tensor_descriptor(
+            base=expert_down + expert_idx * I * H,
+            shape=(I, H),
+            strides=(H, 1),
+            block_shape=(I, H),
+            layout=shared_down_layout,
+        )
+        h_smem = gl.allocate_shared_memory(hidden.dtype.element_ty, shape=[BLOCK_M, I], layout=shared_h_layout)
+        down_smem = gl.allocate_shared_memory(expert_down.dtype.element_ty, shape=[I, H], layout=shared_down_layout)
+        tdm.async_load(h_desc, [0, 0], h_smem)
+        tdm.async_load(down_desc, [0, 0], down_smem)
+        tdm.async_wait(0)
+        h_frag = h_smem.load(layout=dot_a)
+        down_frag = down_smem.load(layout=dot_b)
+        acc = gl.zeros((BLOCK_M, H), dtype=gl.float32, layout=wmma_layout)
+        acc = gl.amd.gfx1250.wmma(h_frag, down_frag, acc)
+
+        bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
+        offs_out = gl.arange(0, H, layout=bias_layout)
+        bias = gl.load(bias_down + expert_idx * H + offs_out).to(gl.float32)
+        acc += bias[None, :]
+
+        rows = base_slot + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, wmma_layout))
+        cols = gl.arange(0, H, layout=gl.SliceLayout(0, wmma_layout))
+        active_rows = rows < gl.minimum(expert_count, expert_count * 0 + EC)
+        token_ids = gl.load(route_tokens + expert_idx * EC + rows, mask=active_rows, other=0).to(gl.int32)
+        probs = gl.load(route_probs + expert_idx * EC + rows, mask=active_rows, other=0.0).to(gl.float32)
+        gl.atomic_add(
+            output + token_ids[:, None] * H + cols[None, :],
+            acc * probs[:, None],
+            sem="relaxed",
+            scope="gpu",
+            mask=active_rows[:, None],
+        )
+
+        task_id = gl.atomic_add(task_heads, 1, sem="relaxed", scope="gpu")
+
+    _global_barrier(barriers, 5, NUM_PROGRAMS)
+
+
+@gluon.jit
 def _single_dispatch_moe_kernel(
     tokens,
     gate_weights,
@@ -575,6 +826,7 @@ def forward_megakernel(
     use_workgroup_cluster: bool = False,
     launch_cooperative_grid: bool = False,
     use_persistent: bool = True,
+    use_tdm_wmma: bool = True,
     return_counts: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del swish_alpha, swish_beta
@@ -613,9 +865,57 @@ def forward_megakernel(
         route_tokens = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.int32)
         route_probs = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.float32)
         task_heads = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-        barriers = torch.empty((4,), device=tokens.device, dtype=torch.int32)
+        barriers = torch.empty((6,), device=tokens.device, dtype=torch.int32)
         init_flag = torch.empty((1,), device=tokens.device, dtype=torch.int32)
         launch_epoch = random.randint(1, (1 << 30) - 1)
+        if (
+            use_tdm_wmma
+            and spec.top_k == 1
+            and spec.activation == ACT_IDENTITY
+            and not spec.gated
+            and spec.h == 64
+            and spec.i == 64
+        ):
+            hidden = torch.empty(
+                (spec.e, spec.expert_capacity, spec.i),
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+            _persistent_tdm_wmma_top1_kernel[(num_programs,)](
+                tokens,
+                gate_weights,
+                expert_up,
+                bias_up,
+                expert_down,
+                bias_down,
+                out,
+                hidden,
+                expert_counts,
+                route_tokens,
+                route_probs,
+                task_heads,
+                barriers,
+                init_flag,
+                launch_epoch,
+                S=spec.s,
+                H=spec.h,
+                I=spec.i,
+                E=spec.e,
+                EC=spec.expert_capacity,
+                BLOCK_E=block_e,
+                BLOCK_H=spec.block_h,
+                BLOCK_M=16,
+                BLOCK_N=64,
+                NUM_PROGRAMS=num_programs,
+                NUM_WARPS=spec.num_warps,
+                num_warps=spec.num_warps,
+                num_ctas=num_ctas,
+                launch_cooperative_grid=launch_cooperative_grid,
+            )
+            if return_counts:
+                return out, expert_counts
+            return out
+
         _persistent_dispatch_moe_kernel[(num_programs,)](
             tokens,
             gate_weights,

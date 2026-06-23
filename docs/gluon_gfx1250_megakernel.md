@@ -15,8 +15,9 @@ The current package has three separate surfaces:
   inside the kernel, computes routing and top-k normalization, appends
   expert-local route records, claims route tasks from a device-side queue,
   runs the expert FFN, applies activation or gated/SwiGLU, and combines route
-  outputs into the final tensor. The scheduler is persistent; the FFN math is
-  still scalar rather than TDM/WMMA tiled.
+  outputs into the final tensor. The scheduler is persistent. For the aligned
+  top-1 identity case with `H=I=64`, GEMM0 and GEMM1 use an in-kernel TDM/WMMA
+  tile path. Other cases currently use the scalar persistent FFN fallback.
 - `forward_scalar_top1_debug(...)`: a smaller single-kernel bring-up probe kept
   for compiler/runtime debugging.
 - `forward_decomposed_staging(...)`: a bring-up path that uses upstream Gluon
@@ -30,9 +31,9 @@ gated/SILU MLP. The default smoke configuration uses two resident Gluon
 programs. A dedicated barrier probe validates scalar atomic participation and
 the same acquire/release spin-barrier protocol used by the megakernel.
 
-The next implementation step is to replace the scalar FFN body with the
-validated TDM/WMMA compute body while preserving the same in-kernel route queue
-and single-dispatch lifecycle.
+The next implementation step is to generalize the TDM/WMMA compute body to
+top-2, gated/SwiGLU, and non-64 hidden/intermediate dimensions while preserving
+the same in-kernel route queue and single-dispatch lifecycle.
 
 ## What The Single Dispatch Does
 
@@ -46,17 +47,19 @@ forward_megakernel(...)
     top-k selection and probability normalization
     expert-local route queues
     persistent route-task claiming
-    scalar routed GEMM0
+    TDM/WMMA routed GEMM0 for aligned top-1 identity
+    scalar routed GEMM0 fallback for remaining modes
     activation or gated epilogue
-    scalar routed GEMM1
+    TDM/WMMA routed GEMM1 for aligned top-1 identity
+    scalar routed GEMM1 fallback for remaining modes
     in-kernel combine
 ```
 
 The host does not launch separate dispatch, GEMM, combine, or communication
 kernels for the MoE body. Once the Gluon kernel starts, the current
 implementation completes the full MoE calculation inside that single launch.
-The optimized target keeps that same host-visible shape and scheduler but
-replaces the scalar GEMM loops with TDM/WMMA tile tasks.
+The optimized target keeps that same host-visible shape and scheduler while
+expanding the TDM/WMMA tile tasks to every supported FlashMoE mode.
 
 ## Kernel Inputs
 
@@ -170,8 +173,10 @@ still preserves the same dependencies.
 ## TDM And WMMA Compute
 
 The validated staging path uses upstream Gluon MoE matmul for the compute body.
-The current runnable `forward_megakernel(...)` uses scalar loops for FFN math.
-The optimized kernel folds the staging compute body into processor tasks:
+The current runnable `forward_megakernel(...)` has an integrated TDM/WMMA path
+for aligned top-1 identity FFN math and scalar persistent fallback for the
+remaining modes. The optimized kernel folds the staging compute body into
+processor tasks:
 
 1. Build TDM descriptors for routed token rows and expert weight tiles.
 2. Use TDM gather to stage non-contiguous token rows into LDS.
@@ -189,8 +194,9 @@ host-visible launches.
 The upstream gfx1250 Gluon MoE matmul body already has the pieces needed for
 this replacement: TDM descriptors, TDM gather/scatter, shared-memory staging,
 `tdm.async_wait`, WMMA layouts, and `gl.amd.gfx1250.wmma`. The integration task
-is to call that style of tile program from the persistent route processor
-instead of launching it as a separate staging matmul.
+is to generalize the first integrated top-1 identity tile path so the
+persistent route processor can cover top-2 and gated/SwiGLU without launching
+separate staging matmuls.
 
 ## Workgroup Clusters And TDM Multicast
 
@@ -258,10 +264,10 @@ launch is device-driven:
 - scheduler state determines when all resident programs exit
 
 No host code has to enqueue per-expert GEMM kernels or per-stage combine
-kernels between those steps. The current scalar `forward_megakernel(...)`
-already preserves the one-dispatch persistent scheduler; the remaining
-paper-parity work is replacing the scalar FFN body with TDM/WMMA tile tasks and
-then enabling clustered TDM multicast.
+kernels between those steps. The current `forward_megakernel(...)` already
+preserves the one-dispatch persistent scheduler and has a TDM/WMMA tile path
+for the simplest aligned FFN case. The remaining paper-parity work is
+generalizing that tile path and then enabling clustered TDM multicast.
 
 ## Implementation Checklist
 
@@ -269,10 +275,9 @@ then enabling clustered TDM multicast.
    correctness baseline.
 2. Keep the decomposed staging path as the Gluon data-layout and TDM/WMMA
    oracle.
-3. Move routed GEMM0 into the persistent route processor with TDM gather and
-   WMMA.
+3. Extend the current routed GEMM0 TDM/WMMA path beyond aligned top-1 identity.
 4. Keep activation and gated MLP epilogues fused into the single dispatch.
-5. Move GEMM1 and combine onto the same TDM/WMMA task path.
+5. Extend the current GEMM1 TDM/WMMA path to top-2 and gated/SwiGLU.
 6. Enable workgroup-cluster tile execution and TDM multicast after single-CTA
    TDM/WMMA tasks are correct.
 7. Link rocSHMEM bitcode and compile a minimal in-kernel communication path.
