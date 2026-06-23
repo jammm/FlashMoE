@@ -1,46 +1,52 @@
 # Gluon gfx1250 Persistent Megakernel
 
 This document describes the Gluon implementation path under
-`flashmoe_gluon/`. It covers the target single persistent megakernel and the
-current staging code used to validate the Gluon/TDM/WMMA building blocks.
+`flashmoe_gluon/`. It covers the currently runnable one-dispatch Gluon
+megakernel, the decomposed staging path used to validate Gluon/TDM/WMMA
+building blocks, and the remaining work to reach the optimized persistent
+paper-parity scheduler.
 
 ## Current Code State
 
-The current package has two separate surfaces:
+The current package has three separate surfaces:
 
-- `forward_megakernel(...)`: the target API for the single persistent Gluon
-  dispatch. It validates the FlashMoE tensor contract and currently stops
-  before launching the final kernel.
+- `forward_megakernel(...)`: the public API for the Gluon megakernel. It now
+  launches one Gluon kernel and computes routing, top-k
+  normalization, expert FFN, activation or gated/SwiGLU, and combine inside
+  that one host-visible dispatch. This is a scalar correctness implementation;
+  it is not yet the optimized TDM/WMMA persistent scheduler.
+- `forward_scalar_top1_debug(...)`: a smaller single-kernel bring-up probe kept
+  for compiler/runtime debugging.
 - `forward_decomposed_staging(...)`: a bring-up path that uses upstream Gluon
   MoE matmul launches for routed GEMM0 and GEMM1. This path validates routing
   metadata, TDM gather/scatter, WMMA matmul, expert weight layout, and combine
   math, but it is not the final megakernel because it uses multiple launches.
 
-The staging path has already exercised top-1 and top-2 routing cases against
-the CPU reference. The next implementation step is to move that validated
-compute body into the single persistent Gluon kernel.
+The runnable `forward_megakernel(...)` path has been exercised against CPU
+reference for top-1 and top-2 vanilla identity MLP, and for top-1 and top-2
+gated/SILU MLP. The next implementation step is to replace the scalar FFN body
+with the validated TDM/WMMA compute body and persistent scheduler.
 
 ## What The Single Dispatch Does
 
-The final Gluon path is one host-visible MoE dispatch:
+The current Gluon megakernel is one host-visible MoE dispatch:
 
 ```text
 forward_megakernel(...)
   one Gluon kernel launch
-    in-kernel initialization
-    in-kernel routing state build
-    persistent work scheduling
-    routed GEMM0
+    per-token routing logits
+    top-k selection and probability normalization
+    scalar routed GEMM0
     activation or gated epilogue
-    routed GEMM1
-    combine
-    optional rocSHMEM put/signal
-    completion and worker exit
+    scalar routed GEMM1
+    in-kernel combine
 ```
 
 The host does not launch separate dispatch, GEMM, combine, or communication
-kernels for the MoE body. Once the Gluon kernel starts, resident programs keep
-claiming work until the device-side scheduler reaches a completion condition.
+kernels for the MoE body. Once the Gluon kernel starts, the current
+implementation completes the full MoE calculation inside that single launch.
+The optimized target keeps that same host-visible shape but replaces the
+per-token scalar loops with resident programs and device-side work scheduling.
 
 ## Kernel Inputs
 
@@ -66,9 +72,10 @@ matmul:
 Those staging fixes are not a separate algorithm. They are the data-layout
 contract the final megakernel must satisfy inside the kernel.
 
-## Persistent Program Model
+## Target Persistent Program Model
 
-The kernel grid is divided into resident programs with device-side roles:
+The optimized target divides the kernel grid into resident programs with
+device-side roles:
 
 - initialization programs clear counters, queue heads, and scratch metadata
 - scheduler programs publish work records and track global progress
@@ -91,11 +98,14 @@ while not done:
 The scheduler exits only after all expected tasks have been published and all
 completion counters have reached their terminal values. It then marks the
 global exit state so processor programs break out of their loops and return.
+The current scalar `forward_megakernel(...)` does not yet implement this
+resident scheduler.
 
 ## In-Kernel Initialization
 
-Strict single-dispatch behavior requires scratch state to be initialized inside
-the same Gluon kernel. The initialization phase clears or seeds:
+Strict single-dispatch behavior for the optimized scheduler requires scratch
+state to be initialized inside the same Gluon kernel. The initialization phase
+clears or seeds:
 
 - per-expert route counts
 - route index storage
@@ -145,7 +155,9 @@ still preserves the same dependencies.
 ## TDM And WMMA Compute
 
 The validated staging path uses upstream Gluon MoE matmul for the compute
-body. The final kernel folds that body into processor tasks:
+body. The current runnable `forward_megakernel(...)` uses scalar loops for
+correctness. The optimized kernel folds the staging compute body into processor
+tasks:
 
 1. Build TDM descriptors for routed token rows and expert weight tiles.
 2. Use TDM gather to stage non-contiguous token rows into LDS.
@@ -192,10 +204,10 @@ The host runtime still has to initialize rocSHMEM, allocate symmetric memory,
 and initialize the HIP module. After that bootstrap, communication can be
 issued from inside the persistent Gluon kernel.
 
-## Why It Stays Persistent
+## Why The Optimized Target Stays Persistent
 
-The Gluon megakernel stays persistent because every stage after launch is
-device-driven:
+The optimized Gluon megakernel stays persistent because every stage after
+launch is device-driven:
 
 - scratch initialization happens in the kernel
 - routing records are produced in the kernel
@@ -207,18 +219,20 @@ device-driven:
 - scheduler state determines when all resident programs exit
 
 No host code has to enqueue per-expert GEMM kernels or per-stage combine
-kernels between those steps. That is the distinction between the current
-decomposed staging path and the final Gluon megakernel: staging validates the
-pieces; the megakernel keeps them inside one resident dispatch.
+kernels between those steps. The current scalar `forward_megakernel(...)`
+already preserves the one-dispatch API shape; the remaining paper-parity work
+is replacing the scalar body with the persistent TDM/WMMA task scheduler.
 
 ## Implementation Checklist
 
-1. Keep the current decomposed staging path as a correctness oracle for the
-   Gluon data-layout contract.
-2. Move routed GEMM0 into the single Gluon kernel with TDM gather and WMMA.
-3. Add activation and gated MLP epilogues.
-4. Move GEMM1 and combine into the same kernel.
-5. Add in-kernel scratch initialization and persistent work queues.
-6. Link rocSHMEM bitcode and compile a minimal in-kernel communication path.
-7. Add the two-PE local smoke test after the host runtime initializes the
+1. Keep the current scalar `forward_megakernel(...)` as the one-dispatch
+   correctness baseline.
+2. Keep the decomposed staging path as the Gluon data-layout and TDM/WMMA
+   oracle.
+3. Move routed GEMM0 into the single Gluon kernel with TDM gather and WMMA.
+4. Keep activation and gated MLP epilogues fused into the single dispatch.
+5. Move GEMM1 and combine onto the same TDM/WMMA task path.
+6. Add in-kernel scratch initialization and persistent work queues.
+7. Link rocSHMEM bitcode and compile a minimal in-kernel communication path.
+8. Add the two-PE local smoke test after the host runtime initializes the
    rocSHMEM HIP module correctly.
