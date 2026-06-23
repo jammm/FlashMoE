@@ -63,6 +63,14 @@ def _multi_phase_barrier(barriers, init_flag, observed, EPOCH: gl.constexpr, NUM
     gl.store(observed + pid, total)
 
 
+@gluon.jit
+def _cluster_arrive_wait(observed):
+    pid = gl.program_id(0)
+    gl.amd.gfx1250.cluster.arrive()
+    gl.amd.gfx1250.cluster.wait()
+    gl.store(observed + pid, pid + 1)
+
+
 def _run_count(grid: int, num_warps: int) -> int:
     counter = torch.zeros((1,), device="cuda", dtype=torch.int32)
     _scalar_atomic_count[(grid,)](counter, num_warps=num_warps)
@@ -99,12 +107,25 @@ def _run_multi_phase(grid: int, num_warps: int) -> tuple[list[int], list[int], i
     return [int(x) for x in barriers.cpu()], [int(x) for x in observed.cpu()], int(init_flag.cpu()[0])
 
 
+def _run_cluster(grid: int, num_warps: int, num_ctas: int) -> list[int]:
+    observed = torch.empty((grid,), device="cuda", dtype=torch.int32)
+    _cluster_arrive_wait[(grid,)](
+        observed,
+        num_warps=num_warps,
+        num_ctas=num_ctas,
+    )
+    torch.cuda.synchronize()
+    return [int(x) for x in observed.cpu()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--grid", type=int, default=2)
     parser.add_argument("--num-warps", type=int, default=4)
     parser.add_argument("--count-only", action="store_true")
     parser.add_argument("--multi-phase", action="store_true")
+    parser.add_argument("--cluster", action="store_true")
+    parser.add_argument("--num-ctas", type=int, default=2)
     args = parser.parse_args()
 
     torch.cuda.set_device(0)
@@ -126,6 +147,9 @@ def main() -> None:
             "init_flag",
             init_flag,
         )
+    if args.cluster:
+        observed = _run_cluster(args.grid, args.num_warps, args.num_ctas)
+        print("cluster_arrive_wait", "grid", args.grid, "num_ctas", args.num_ctas, "observed", observed)
 
 
 if __name__ == "__main__":
