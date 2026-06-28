@@ -6,17 +6,18 @@
  * Uses stream-based APIs which work without MPI support.
  *
  * Build:
- *   source /jam/moe/venv/bin/activate
- *   export ROCM_PATH=/jam/moe/venv/lib/python3.12/site-packages/_rocm_sdk_devel
- *   export ROCSHMEM_ROOT=/jam/moe/rocm-systems/projects/rocshmem/install
- *   hipcc -std=c++20 --offload-arch=gfx1250 \
- *       -I$ROCM_PATH/include -I$ROCSHMEM_ROOT/include \
- *       -L$ROCSHMEM_ROOT/lib -L$ROCM_PATH/lib \
+ *   source /jam/venv/bin/activate
+ *   export ROCM_PATH="$(rocm-sdk path --root)"
+ *   export ROCM_CORE_LIB=/jam/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib
+ *   export ROCM_SYSDEPS_LIB=$ROCM_PATH/lib/rocm_sysdeps/lib
+ *   $ROCM_PATH/bin/hipcc -std=c++20 -fgpu-rdc --offload-arch=gfx1250 \
+ *       -I$ROCM_PATH/include \
+ *       -L$ROCM_PATH/lib -L$ROCM_CORE_LIB -L$ROCM_SYSDEPS_LIB \
  *       -o tests/multi_gpu_test tests/multi_gpu_rocshmem.hip.cpp \
- *       -lrocshmem -lamdhip64 -lhsa-runtime64 -lpthread
+ *       -lrocshmem -lamdhip64 -lhsa-runtime64 -lnuma -lpthread -ldl -lrt
  *
  * Run:
- *   export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCSHMEM_ROOT/lib:$LD_LIBRARY_PATH"
+ *   export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_CORE_LIB:$ROCM_SYSDEPS_LIB:$LD_LIBRARY_PATH"
  *   ./tests/multi_gpu_test
  *****************************************************************************/
 

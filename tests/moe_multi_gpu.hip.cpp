@@ -21,17 +21,18 @@
  *   6. Combine operation aggregates results
  *
  * Build:
- *   source /jam/moe/venv/bin/activate
- *   export ROCM_PATH=/jam/moe/venv/lib/python3.12/site-packages/_rocm_sdk_devel
- *   export ROCSHMEM_ROOT=/jam/moe/rocm-systems/projects/rocshmem/install
- *   hipcc -std=c++20 --offload-arch=gfx1250 -O3 -fgpu-rdc \
- *       -I./csrc/include -I$ROCM_PATH/include -I$ROCSHMEM_ROOT/include \
- *       -L$ROCM_PATH/lib -L$ROCSHMEM_ROOT/lib \
+ *   source /jam/venv/bin/activate
+ *   export ROCM_PATH="$(rocm-sdk path --root)"
+ *   export ROCM_CORE_LIB=/jam/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib
+ *   export ROCM_SYSDEPS_LIB=$ROCM_PATH/lib/rocm_sysdeps/lib
+ *   $ROCM_PATH/bin/hipcc -std=c++20 --offload-arch=gfx1250 -O3 -fgpu-rdc \
+ *       -I./csrc/include -I$ROCM_PATH/include \
+ *       -L$ROCM_PATH/lib -L$ROCM_CORE_LIB -L$ROCM_SYSDEPS_LIB \
  *       -o tests/moe_multi_gpu tests/moe_multi_gpu.hip.cpp \
- *       -lhipblaslt -lamdhip64 -lrocshmem
+ *       -lhipblaslt -lamdhip64 -lhsa-runtime64 -lrocshmem -lnuma -lpthread -ldl -lrt
  *
  * Run:
- *   export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCSHMEM_ROOT/lib:$LD_LIBRARY_PATH"
+ *   export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_CORE_LIB:$ROCM_SYSDEPS_LIB:$LD_LIBRARY_PATH"
  *   ./tests/moe_multi_gpu
  *
  * Copyright (c) 2025, Osayamen Jonathan Aimuyo
@@ -431,16 +432,25 @@ void run_moe_pe(int rank, int npes, SharedBootstrap* shared) {
     // Use stderr for immediate output
     fprintf(stderr, "[PE %d] Starting MoE forward pass (PID %d)\n", rank, getpid());
 
-    // Set device FIRST before any HIP/rocSHMEM operations
-    hipError_t hip_err = hipSetDevice(rank);
+    // Set a physical device FIRST before any HIP/rocSHMEM operations.
+    // Multiple PEs can share one visible GPU for single-GPU smoke testing.
+    int device_count = 0;
+    CHECK_HIP(hipGetDeviceCount(&device_count));
+    if (device_count <= 0) {
+        fprintf(stderr, "[PE %d] No HIP devices available\n", rank);
+        exit(1);
+    }
+    const int device_id = rank % device_count;
+    hipError_t hip_err = hipSetDevice(device_id);
     if (hip_err != hipSuccess) {
-        fprintf(stderr, "[PE %d] hipSetDevice failed: %s\n", rank, hipGetErrorString(hip_err));
+        fprintf(stderr, "[PE %d] hipSetDevice(%d) failed: %s\n",
+                rank, device_id, hipGetErrorString(hip_err));
         exit(1);
     }
 
     hipDeviceProp_t props;
-    CHECK_HIP(hipGetDeviceProperties(&props, rank));
-    fprintf(stderr, "[PE %d] Device: %s\n", rank, props.name);
+    CHECK_HIP(hipGetDeviceProperties(&props, device_id));
+    fprintf(stderr, "[PE %d] Device %d/%d: %s\n", rank, device_id, device_count, props.name);
 
     // ========================================================================
     // Initialize rocSHMEM BEFORE creating stream
