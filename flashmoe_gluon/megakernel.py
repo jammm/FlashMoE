@@ -191,10 +191,12 @@ def _single_dispatch_top1_debug_kernel(
     for expert_id in gl.static_range(0, BLOCK_E):
         if expert_id < E:
             logit = zero_f
-            for h_abs in gl.static_range(0, H):
+            h_abs = zero_i
+            while h_abs < H:
                 t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                 w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                 logit += t * w
+                h_abs += 1
             row_max = gl.maximum(row_max, logit)
 
     top_idx = zero_i
@@ -203,24 +205,30 @@ def _single_dispatch_top1_debug_kernel(
         if expert_id < E:
             expert_id_t = zero_i + expert_id
             logit = zero_f
-            for h_abs in gl.static_range(0, H):
+            h_abs = zero_i
+            while h_abs < H:
                 t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                 w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                 logit += t * w
+                h_abs += 1
             prob = gl.exp(logit - row_max)
             better = prob > top_prob
             top_prob = gl.where(better, prob, top_prob)
             top_idx = gl.where(better, expert_id_t, top_idx)
 
     route_vals = gl.load(bias_down + top_idx * H + offs_h, mask=h_mask, other=0.0).to(gl.float32)
-    for i_abs in gl.static_range(0, I):
+    i_abs = zero_i
+    while i_abs < I:
         up_acc = gl.load(bias_up + top_idx * I + i_abs).to(gl.float32)
-        for h_abs in gl.static_range(0, H):
+        h_abs = zero_i
+        while h_abs < H:
             t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
             wu = gl.load(expert_up + top_idx * H * I + h_abs * I + i_abs).to(gl.float32)
             up_acc += t * wu
+            h_abs += 1
         wd = gl.load(expert_down + top_idx * I * H + i_abs * H + offs_h, mask=h_mask, other=0.0).to(gl.float32)
         route_vals += up_acc * wd
+        i_abs += 1
     gl.store(output + token_id * H + offs_h, route_vals, mask=h_mask)
 
 
@@ -354,7 +362,8 @@ def _gemm0_ws_producer(
         other=0,
     ).to(gl.int32)
     empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
-    for h_tile in gl.static_range(0, H // BLOCK_N):
+    h_tile = base_slot * 0
+    while h_tile < H // BLOCK_N:
         buffer_idx = h_tile % NUM_BUFFERS
         empty_bar = load_empty_bars.index(buffer_idx)
         ready_bar = load_ready_bars.index(buffer_idx)
@@ -376,10 +385,12 @@ def _gemm0_ws_producer(
         tdm.async_gather(x_desc, gathered_tokens, x_buffer.index(buffer_idx))
         tdm.async_load(w_desc, [0, 0], w_buffer.index(buffer_idx), mbarrier=ready_bar)
         empty_counter = empty_counter.next()
+        h_tile += 1
 
     if GATED:
         v_empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
-        for h_tile_v in gl.static_range(0, H // BLOCK_N):
+        h_tile_v = base_slot * 0
+        while h_tile_v < H // BLOCK_N:
             buffer_idx_v = h_tile_v % NUM_BUFFERS
             empty_bar_v = v_load_empty_bars.index(buffer_idx_v)
             ready_bar_v = v_load_ready_bars.index(buffer_idx_v)
@@ -401,6 +412,7 @@ def _gemm0_ws_producer(
             tdm.async_gather(xv_desc, gathered_tokens, xv_buffer.index(buffer_idx_v))
             tdm.async_load(wv_desc, [0, 0], wv_buffer.index(buffer_idx_v), mbarrier=ready_bar_v)
             v_empty_counter = v_empty_counter.next()
+            h_tile_v += 1
 
 
 @gluon.jit
@@ -437,7 +449,8 @@ def _gemm0_ws_compute(
     mbarrier.wait(acc_empty_bar, phase=1)
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
-    for h_tile in gl.static_range(0, H // BLOCK_N):
+    h_tile = expert_idx * 0
+    while h_tile < H // BLOCK_N:
         buffer_idx = h_tile % NUM_BUFFERS
         ready_bar = load_ready_bars.index(buffer_idx)
         empty_bar = load_empty_bars.index(buffer_idx)
@@ -447,6 +460,7 @@ def _gemm0_ws_compute(
         acc = gl.amd.gfx1250.wmma(x_frag, w_frag, acc)
         mbarrier.arrive(empty_bar, count=1)
         ready_counter = ready_counter.next()
+        h_tile += 1
 
     bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
     offs_i = base_i + gl.arange(0, BLOCK_N, layout=bias_layout)
@@ -456,7 +470,8 @@ def _gemm0_ws_compute(
     if GATED:
         v_ready_counter = _WsPhaseCounter.create(0, NUM_BUFFERS)
         acc_v = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
-        for h_tile_v in gl.static_range(0, H // BLOCK_N):
+        h_tile_v = expert_idx * 0
+        while h_tile_v < H // BLOCK_N:
             buffer_idx_v = h_tile_v % NUM_BUFFERS
             ready_bar_v = v_load_ready_bars.index(buffer_idx_v)
             empty_bar_v = v_load_empty_bars.index(buffer_idx_v)
@@ -466,6 +481,7 @@ def _gemm0_ws_compute(
             acc_v = gl.amd.gfx1250.wmma(xv_frag, wv_frag, acc_v)
             mbarrier.arrive(empty_bar_v, count=1)
             v_ready_counter = v_ready_counter.next()
+            h_tile_v += 1
         bias_v = gl.load(bias_up_v + expert_idx * I + offs_i).to(gl.float32)
         acc_v += gl.convert_layout(gl.expand_dims(bias_v, 0), wmma_layout)
         hidden_acc *= acc_v
@@ -542,7 +558,8 @@ def _gemm1_ws_producer(
         layout=shared_down_layout,
     )
     zero_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0], [])
-    for i_tile in gl.static_range(0, I // BLOCK_N):
+    i_tile = base_slot * 0
+    while i_tile < I // BLOCK_N:
         buffer_idx = i_tile % NUM_BUFFERS
         empty_bar = load_empty_bars.index(buffer_idx)
         ready_bar = load_ready_bars.index(buffer_idx)
@@ -554,6 +571,7 @@ def _gemm1_ws_producer(
         tdm.async_load(hidden_desc, [base_slot, i_tile * BLOCK_N], h_buffer.index(buffer_idx))
         tdm.async_load(down_desc, [i_tile * BLOCK_N, base_h], down_buffer.index(buffer_idx), mbarrier=ready_bar)
         empty_counter = empty_counter.next()
+        i_tile += 1
 
 
 @gluon.jit
@@ -578,7 +596,8 @@ def _gemm1_ws_compute(
     acc_ready_bar = acc_ready_bars.index(0)
     mbarrier.wait(acc_empty_bar, phase=1)
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
-    for i_tile in gl.static_range(0, I // BLOCK_N):
+    i_tile = gl.program_id(0) * 0
+    while i_tile < I // BLOCK_N:
         buffer_idx = i_tile % NUM_BUFFERS
         ready_bar = load_ready_bars.index(buffer_idx)
         empty_bar = load_empty_bars.index(buffer_idx)
@@ -588,6 +607,7 @@ def _gemm1_ws_compute(
         acc = gl.amd.gfx1250.wmma(h_frag, down_frag, acc)
         mbarrier.arrive(empty_bar, count=1)
         ready_counter = ready_counter.next()
+        i_tile += 1
     acc_buffer.index(0).store(acc)
     _wait_dscnt0()
     mbarrier.arrive(acc_ready_bar, count=1)
@@ -691,7 +711,8 @@ def _gemm0_channel_ws_producer(
     shared_b_layout: gl.constexpr,
 ):
     empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
-    for h_tile in gl.static_range(0, H // BLOCK_N):
+    h_tile = base_slot * 0
+    while h_tile < H // BLOCK_N:
         buffer_idx = h_tile % NUM_BUFFERS
         empty_bar = load_empty_bars.index(buffer_idx)
         ready_bar = load_ready_bars.index(buffer_idx)
@@ -713,10 +734,12 @@ def _gemm0_channel_ws_producer(
         tdm.async_load(x_desc, [base_slot, 0], x_buffer.index(buffer_idx))
         tdm.async_load(w_desc, [0, 0], w_buffer.index(buffer_idx), mbarrier=ready_bar)
         empty_counter = empty_counter.next()
+        h_tile += 1
 
     if GATED:
         v_empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
-        for h_tile_v in gl.static_range(0, H // BLOCK_N):
+        h_tile_v = base_slot * 0
+        while h_tile_v < H // BLOCK_N:
             buffer_idx_v = h_tile_v % NUM_BUFFERS
             empty_bar_v = v_load_empty_bars.index(buffer_idx_v)
             ready_bar_v = v_load_ready_bars.index(buffer_idx_v)
@@ -738,6 +761,7 @@ def _gemm0_channel_ws_producer(
             tdm.async_load(xv_desc, [base_slot, 0], xv_buffer.index(buffer_idx_v))
             tdm.async_load(wv_desc, [0, 0], wv_buffer.index(buffer_idx_v), mbarrier=ready_bar_v)
             v_empty_counter = v_empty_counter.next()
+            h_tile_v += 1
 
 
 @gluon.jit
@@ -777,7 +801,8 @@ def _gemm1_channel_ws_producer(
         layout=shared_down_layout,
     )
     zero_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0], [])
-    for i_tile in gl.static_range(0, I // BLOCK_N):
+    i_tile = base_slot * 0
+    while i_tile < I // BLOCK_N:
         buffer_idx = i_tile % NUM_BUFFERS
         empty_bar = load_empty_bars.index(buffer_idx)
         ready_bar = load_ready_bars.index(buffer_idx)
@@ -789,6 +814,7 @@ def _gemm1_channel_ws_producer(
         tdm.async_load(hidden_desc, [base_slot, i_tile * BLOCK_N], h_buffer.index(buffer_idx))
         tdm.async_load(down_desc, [i_tile * BLOCK_N, base_h], down_buffer.index(buffer_idx), mbarrier=ready_bar)
         empty_counter = empty_counter.next()
+        i_tile += 1
 
 
 @gluon.jit
@@ -1355,11 +1381,14 @@ def _rocshmem_os_subscriber_publisher(
                         else:
                             active_blocks = (channel_count + BLOCK_M - 1) // BLOCK_M
                             hidden_channel = source_pe_static * NLX + lx
-                            for route_block in gl.static_range(0, route_blocks):
-                                if route_block < active_blocks:
-                                    for i_tile in gl.static_range(0, i_tiles):
-                                        task = hidden_channel * route_blocks * i_tiles + route_block * i_tiles + i_tile
-                                        _enqueue_compute_task(task_queue, task_tail, task_bound, task)
+                            route_block = gl.program_id(0) * 0
+                            while route_block < active_blocks:
+                                i_tile = gl.program_id(0) * 0
+                                while i_tile < i_tiles:
+                                    task = hidden_channel * route_blocks * i_tiles + route_block * i_tiles + i_tile
+                                    _enqueue_compute_task(task_queue, task_tail, task_bound, task)
+                                    i_tile += 1
+                                route_block += 1
 
         publish_tail_snapshot = gl.atomic_add(publish_tail, 0, sem="acquire", scope="gpu")
         while publish_head < publish_tail_snapshot:
@@ -1402,11 +1431,14 @@ def _rocshmem_os_subscriber_publisher(
                         if result_count > 0:
                             active_blocks_res = (result_count + BLOCK_M - 1) // BLOCK_M
                             owner_channel = owner_pe_static * NLX + lx_res
-                            for route_block_res in gl.static_range(0, route_blocks):
-                                if route_block_res < active_blocks_res:
-                                    for h_tile_res in gl.static_range(0, h_tiles):
-                                        task_res = combine_base + owner_channel * route_blocks * h_tiles + route_block_res * h_tiles + h_tile_res
-                                        _enqueue_compute_task(task_queue, task_tail, task_bound, task_res)
+                            route_block_res = gl.program_id(0) * 0
+                            while route_block_res < active_blocks_res:
+                                h_tile_res = gl.program_id(0) * 0
+                                while h_tile_res < h_tiles:
+                                    task_res = combine_base + owner_channel * route_blocks * h_tiles + route_block_res * h_tiles + h_tile_res
+                                    _enqueue_compute_task(task_queue, task_tail, task_bound, task_res)
+                                    h_tile_res += 1
+                                route_block_res += 1
 
         dispatch_seen_total = gl.program_id(0) * 0
         result_seen_total = gl.program_id(0) * 0
@@ -1694,10 +1726,12 @@ def _persistent_dispatch_moe_kernel(
             if expert_id < E:
                 expert_id_t = zero_i + expert_id
                 logit = zero_f
-                for h_abs in gl.static_range(0, H):
+                h_abs = zero_i
+                while h_abs < H:
                     t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                     w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                     logit += t * w
+                    h_abs += 1
 
                 better0 = logit > top0_logit
                 better1 = (logit > top1_logit) & (logit <= top0_logit)
@@ -1755,24 +1789,29 @@ def _persistent_dispatch_moe_kernel(
                 other=0.0,
             ).to(gl.float32)
 
-            for i_abs in gl.static_range(0, I):
+            i_abs = zero_i
+            while i_abs < I:
                 up_acc = gl.load(bias_up + expert_idx * I + i_abs).to(gl.float32)
-                for h_abs in gl.static_range(0, H):
+                h_abs = zero_i
+                while h_abs < H:
                     t = gl.load(tokens + routed_token * H + h_abs, mask=active, other=0.0).to(gl.float32)
                     wu = gl.load(
                         expert_up + expert_idx * H * I + h_abs * I + i_abs
                     ).to(gl.float32)
                     up_acc += t * wu
+                    h_abs += 1
 
                 hidden = _apply_activation(up_acc, ACTIVATION)
                 if GATED:
                     v_acc = gl.load(bias_up_v + expert_idx * I + i_abs).to(gl.float32)
-                    for h_abs in gl.static_range(0, H):
+                    h_abs = zero_i
+                    while h_abs < H:
                         t = gl.load(tokens + routed_token * H + h_abs, mask=active, other=0.0).to(gl.float32)
                         wv = gl.load(
                             expert_up_v + expert_idx * H * I + h_abs * I + i_abs
                         ).to(gl.float32)
                         v_acc += t * wv
+                        h_abs += 1
                     hidden *= v_acc
 
                 wd = gl.load(
@@ -1781,6 +1820,7 @@ def _persistent_dispatch_moe_kernel(
                     other=0.0,
                 ).to(gl.float32)
                 route_vals += hidden * wd
+                i_abs += 1
 
             gl.atomic_add(
                 output + routed_token * H + offs_h,
@@ -1936,9 +1976,11 @@ def _local_ws_epilogue_loop_p(p):
             sync_idx = expert_idx * p.ROUTE_BLOCKS + route_block
             done_tiles = gl.atomic_add(p.tile_sync + sync_idx, 1, sem="release", scope="gpu") + 1
             if done_tiles == p.I_TILES:
-                for h_enqueue in gl.static_range(0, p.H_TILES):
+                h_enqueue = pid * 0
+                while h_enqueue < p.H_TILES:
                     downstream_task = p.GEMM0_TASKS + expert_idx * p.ROUTE_BLOCKS * p.H_TILES + route_block * p.H_TILES + h_enqueue
                     _enqueue_task(p.task_queue, p.task_tail, downstream_task)
+                    h_enqueue += 1
         else:
             gemm1_id = task_id - p.GEMM0_TASKS
             expert_idx = gemm1_id // (p.ROUTE_BLOCKS * p.H_TILES)
@@ -2274,10 +2316,12 @@ def _persistent_tdm_wmma_kernel(
             if expert_id < E:
                 expert_id_t = zero_i + expert_id
                 logit = zero_f
-                for h_abs in gl.static_range(0, H):
+                h_abs = zero_i
+                while h_abs < H:
                     t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                     w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                     logit += t * w
+                    h_abs += 1
 
                 better0 = logit > top0_logit
                 better1 = (logit > top1_logit) & (logit <= top0_logit)
@@ -2693,10 +2737,12 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                     if expert_id < E:
                         expert_id_t = zero_i + expert_id
                         logit = zero_f
-                        for h_abs in gl.static_range(0, H):
+                        h_abs = zero_i
+                        while h_abs < H:
                             t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                             w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                             logit += t * w
+                            h_abs += 1
                         better0 = logit > top0_logit
                         better1 = (logit > top1_logit) & (logit <= top0_logit)
                         old_top0_idx = top0_idx
@@ -2947,9 +2993,11 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                 sync_idx = hidden_channel * route_blocks + route_block
                 done_tiles = gl.atomic_add(tile_sync + sync_idx, 1, sem="acq_rel", scope="gpu") + 1
                 if done_tiles == i_tiles:
-                    for h_enqueue in gl.static_range(0, h_tiles):
+                    h_enqueue = pid * 0
+                    while h_enqueue < h_tiles:
                         downstream_task = gemm0_tasks + hidden_channel * route_blocks * h_tiles + route_block * h_tiles + h_enqueue
                         _enqueue_compute_task(task_queue, task_tail, task_bound, downstream_task)
+                        h_enqueue += 1
                 if DEBUG:
                     gl.atomic_add(debug_state + 26, 1, sem="relaxed", scope="gpu")
                 gl.atomic_add(tasks_done, 1, sem="release", scope="gpu")
@@ -3152,10 +3200,12 @@ def _single_dispatch_moe_kernel(
         if expert_id < E:
             expert_id_t = zero_i + expert_id
             logit = zero_f
-            for h_abs in gl.static_range(0, H):
+            h_abs = zero_i
+            while h_abs < H:
                 t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                 w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
                 logit += t * w
+                h_abs += 1
 
             better0 = logit > top0_logit
             better1 = (logit > top1_logit) & (logit <= top0_logit)
@@ -3190,24 +3240,29 @@ def _single_dispatch_moe_kernel(
                 other=0.0,
             ).to(gl.float32)
 
-            for i_abs in gl.static_range(0, I):
+            i_abs = zero_i
+            while i_abs < I:
                 up_acc = gl.load(bias_up + expert_idx * I + i_abs).to(gl.float32)
-                for h_abs in gl.static_range(0, H):
+                h_abs = zero_i
+                while h_abs < H:
                     t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                     wu = gl.load(
                         expert_up + expert_idx * H * I + h_abs * I + i_abs
                     ).to(gl.float32)
                     up_acc += t * wu
+                    h_abs += 1
 
                 hidden = _apply_activation(up_acc, ACTIVATION)
                 if GATED:
                     v_acc = gl.load(bias_up_v + expert_idx * I + i_abs).to(gl.float32)
-                    for h_abs in gl.static_range(0, H):
+                    h_abs = zero_i
+                    while h_abs < H:
                         t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
                         wv = gl.load(
                             expert_up_v + expert_idx * H * I + h_abs * I + i_abs
                         ).to(gl.float32)
                         v_acc += t * wv
+                        h_abs += 1
                     hidden *= v_acc
 
                 wd = gl.load(
@@ -3216,6 +3271,7 @@ def _single_dispatch_moe_kernel(
                     other=0.0,
                 ).to(gl.float32)
                 route_vals += hidden * wd
+                i_abs += 1
 
             out_vals += route_prob * route_vals
 
