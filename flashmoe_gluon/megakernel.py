@@ -9,6 +9,8 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.amd.gfx1250 import mbarrier, tdm
 
+from . import rocshmem
+
 
 ACT_IDENTITY = 0
 ACT_SILU = 1
@@ -1370,6 +1372,351 @@ def _persistent_tdm_wmma_kernel(
     _global_barrier(barriers, 5, NUM_PROGRAMS)
 
 
+
+
+@gluon.jit
+def _persistent_rocshmem_scalar_kernel(
+    tokens,
+    gate_weights,
+    local_expert_up,
+    bias_up,
+    local_expert_up_v,
+    bias_up_v,
+    local_expert_down,
+    bias_down,
+    output,
+    dispatch_tokens,
+    dispatch_token_ids,
+    dispatch_probs,
+    dispatch_counts,
+    dispatch_signals,
+    result_values,
+    result_counts,
+    result_signals,
+    compute_done,
+    processor_ready,
+    processor_mailboxes,
+    barriers,
+    init_flag,
+    launch_epoch,
+    S: gl.constexpr,
+    H: gl.constexpr,
+    I: gl.constexpr,
+    E: gl.constexpr,
+    WORLD: gl.constexpr,
+    NLX: gl.constexpr,
+    EC: gl.constexpr,
+    TOP_K: gl.constexpr,
+    BLOCK_E: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    ACTIVATION: gl.constexpr,
+    GATED: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    my_pe = rocshmem.my_pe()
+    h_layout: gl.constexpr = _hidden_layout(NUM_WARPS)
+    offs_h = gl.arange(0, BLOCK_H, layout=h_layout)
+    h_mask = offs_h < H
+    epoch_u64 = gl.full((), launch_epoch, gl.uint64)
+
+    if pid == 0:
+        for idx in gl.static_range(0, WORLD * WORLD * NLX):
+            gl.store(dispatch_counts + idx, 0)
+            gl.store(dispatch_signals + idx, gl.cast(0, gl.uint64))
+            gl.store(result_counts + idx, 0)
+            gl.store(result_signals + idx, gl.cast(0, gl.uint64))
+            gl.store(compute_done + idx, 0)
+        for phase in gl.static_range(0, 9):
+            gl.store(barriers + phase, 0)
+        if NUM_PROGRAMS > 1:
+            gl.atomic_xchg(init_flag, launch_epoch, sem="release", scope="gpu")
+        else:
+            gl.store(init_flag, launch_epoch)
+
+    if NUM_PROGRAMS > 1:
+        while gl.atomic_cas(init_flag, launch_epoch, launch_epoch, sem="acquire", scope="gpu") != launch_epoch:
+            pass
+
+    out_base = pid * BLOCK_H
+    while out_base < S * H:
+        gl.store(
+            output + out_base + offs_h,
+            gl.full((BLOCK_H,), 0.0, gl.float32, layout=h_layout),
+            mask=out_base + offs_h < S * H,
+        )
+        out_base += NUM_PROGRAMS * BLOCK_H
+    _persistent_phase_barrier(barriers, 0, NUM_PROGRAMS)
+
+    token_id = pid
+    while token_id < S:
+        zero_f = token_id.to(gl.float32) * 0.0
+        zero_i = token_id * 0
+        top0_idx = zero_i
+        top1_idx = zero_i
+        top0_logit = zero_f - float("inf")
+        top1_logit = zero_f - float("inf")
+
+        for expert_id in gl.static_range(0, BLOCK_E):
+            if expert_id < E:
+                expert_id_t = zero_i + expert_id
+                logit = zero_f
+                for h_abs in gl.static_range(0, H):
+                    t = gl.load(tokens + token_id * H + h_abs).to(gl.float32)
+                    w = gl.load(gate_weights + h_abs * E + expert_id).to(gl.float32)
+                    logit += t * w
+                better0 = logit > top0_logit
+                better1 = (logit > top1_logit) & (logit <= top0_logit)
+                old_top0_idx = top0_idx
+                old_top0_logit = top0_logit
+                top1_idx = gl.where(better0, old_top0_idx, top1_idx)
+                top1_logit = gl.where(better0, old_top0_logit, top1_logit)
+                top0_idx = gl.where(better0, expert_id_t, top0_idx)
+                top0_logit = gl.where(better0, logit, top0_logit)
+                top1_idx = gl.where(better1, expert_id_t, top1_idx)
+                top1_logit = gl.where(better1, logit, top1_logit)
+
+        max_top = gl.maximum(top0_logit, top1_logit)
+        top0_exp = gl.exp(top0_logit - max_top)
+        top1_exp = gl.exp(top1_logit - max_top)
+        denom = top0_exp + top1_exp
+
+        for route_id in gl.static_range(0, 2):
+            if route_id < TOP_K:
+                expert_idx = gl.where(route_id == 0, top0_idx, top1_idx)
+                owner_pe = expert_idx // NLX
+                local_expert = expert_idx - owner_pe * NLX
+                route_prob = zero_f + 1.0
+                if TOP_K == 2:
+                    route_exp = gl.where(route_id == 0, top0_exp, top1_exp)
+                    route_prob = route_exp / denom
+
+                count_idx = (owner_pe * WORLD + my_pe) * NLX + local_expert
+                slot = gl.atomic_add(dispatch_counts + count_idx, 1, sem="relaxed", scope="gpu")
+                active = slot < EC
+                safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
+                route_offset = count_idx * EC + safe_slot
+                token_row = gl.load(tokens + token_id * H + offs_h, mask=h_mask, other=0.0)
+                gl.store(dispatch_token_ids + route_offset, token_id, mask=active)
+                gl.store(dispatch_probs + route_offset, route_prob, mask=active)
+                gl.store(dispatch_tokens + route_offset * H + offs_h, token_row, mask=active & h_mask)
+                if active & (owner_pe != my_pe):
+                    rocshmem.putmem_wg(
+                        dispatch_tokens + route_offset * H,
+                        dispatch_tokens + route_offset * H,
+                        H * 2,
+                        owner_pe,
+                    )
+                    rocshmem.putmem_wg(
+                        dispatch_token_ids + route_offset,
+                        dispatch_token_ids + route_offset,
+                        4,
+                        owner_pe,
+                    )
+                    rocshmem.putmem_wg(
+                        dispatch_probs + route_offset,
+                        dispatch_probs + route_offset,
+                        4,
+                        owner_pe,
+                    )
+        token_id += NUM_PROGRAMS
+
+    _persistent_phase_barrier(barriers, 1, NUM_PROGRAMS)
+
+    if pid == 0:
+        local_owner_channel = (my_pe * WORLD + my_pe) * NLX
+        for lx in gl.static_range(0, NLX):
+            channel_idx = local_owner_channel + lx
+            published_count = gl.load(dispatch_counts + channel_idx)
+            published_count = gl.minimum(published_count, published_count * 0 + EC)
+            gl.store(dispatch_counts + channel_idx, published_count)
+            gl.store(dispatch_signals + channel_idx, epoch_u64)
+
+        if WORLD == 2:
+            owner_pe_send = 1 - my_pe
+            remote_owner_channel = (owner_pe_send * WORLD + my_pe) * NLX
+            for lx in gl.static_range(0, NLX):
+                channel_idx = remote_owner_channel + lx
+                published_count = gl.load(dispatch_counts + channel_idx)
+                published_count = gl.minimum(published_count, published_count * 0 + EC)
+                gl.store(dispatch_counts + channel_idx, published_count)
+                gl.store(dispatch_signals + channel_idx, epoch_u64)
+                rocshmem.putmem_wg(
+                    dispatch_counts + channel_idx,
+                    dispatch_counts + channel_idx,
+                    4,
+                    owner_pe_send,
+                )
+                rocshmem.putmem_wg(
+                    dispatch_signals + channel_idx,
+                    dispatch_signals + channel_idx,
+                    8,
+                    owner_pe_send,
+                )
+            rocshmem.quiet()
+    _persistent_phase_barrier(barriers, 2, NUM_PROGRAMS)
+
+    if pid == 0:
+        rocshmem.barrier_all()
+        if WORLD == 2:
+            source_pe_fetch = 1 - my_pe
+            fetch_channel = (my_pe * WORLD + source_pe_fetch) * NLX
+            for lx in gl.static_range(0, NLX):
+                channel_idx = fetch_channel + lx
+                rocshmem.getmem_wg(
+                    dispatch_counts + channel_idx,
+                    dispatch_counts + channel_idx,
+                    4,
+                    source_pe_fetch,
+                )
+                rocshmem.getmem_wg(
+                    dispatch_token_ids + channel_idx * EC,
+                    dispatch_token_ids + channel_idx * EC,
+                    EC * 4,
+                    source_pe_fetch,
+                )
+                rocshmem.getmem_wg(
+                    dispatch_probs + channel_idx * EC,
+                    dispatch_probs + channel_idx * EC,
+                    EC * 4,
+                    source_pe_fetch,
+                )
+                rocshmem.getmem_wg(
+                    dispatch_tokens + channel_idx * EC * H,
+                    dispatch_tokens + channel_idx * EC * H,
+                    EC * H * 2,
+                    source_pe_fetch,
+                )
+            rocshmem.quiet()
+    _persistent_phase_barrier(barriers, 3, NUM_PROGRAMS)
+
+    _scheduler_reset(processor_ready, processor_mailboxes, NUM_PROGRAMS)
+    _persistent_phase_barrier(barriers, 4, NUM_PROGRAMS)
+
+    total_compute_tasks: gl.constexpr = WORLD * NLX * EC
+    if pid == 0:
+        _scheduler_run(processor_ready, processor_mailboxes, total_compute_tasks, NUM_PROGRAMS)
+    else:
+        task_id = _processor_next_task(processor_ready, processor_mailboxes)
+        while task_id < total_compute_tasks:
+            source_pe = task_id // (NLX * EC)
+            rem = task_id - source_pe * NLX * EC
+            local_expert = rem // EC
+            slot = rem - local_expert * EC
+            count_idx = (my_pe * WORLD + source_pe) * NLX + local_expert
+            active = slot < gl.load(dispatch_counts + count_idx)
+            row_offset = count_idx * EC + slot
+
+            route_vals = gl.load(
+                bias_down + local_expert * H + offs_h,
+                mask=h_mask,
+                other=0.0,
+            ).to(gl.float32)
+            for i_abs in gl.static_range(0, I):
+                up_acc = gl.load(bias_up + local_expert * I + i_abs).to(gl.float32)
+                for h_abs in gl.static_range(0, H):
+                    t = gl.load(dispatch_tokens + row_offset * H + h_abs, mask=active, other=0.0).to(gl.float32)
+                    wu = gl.load(local_expert_up + local_expert * H * I + h_abs * I + i_abs).to(gl.float32)
+                    up_acc += t * wu
+                hidden = _apply_activation(up_acc, ACTIVATION)
+                if GATED:
+                    v_acc = gl.load(bias_up_v + local_expert * I + i_abs).to(gl.float32)
+                    for h_abs_v in gl.static_range(0, H):
+                        t_v = gl.load(dispatch_tokens + row_offset * H + h_abs_v, mask=active, other=0.0).to(gl.float32)
+                        wv = gl.load(local_expert_up_v + local_expert * H * I + h_abs_v * I + i_abs).to(gl.float32)
+                        v_acc += t_v * wv
+                    hidden *= v_acc
+                wd = gl.load(
+                    local_expert_down + local_expert * I * H + i_abs * H + offs_h,
+                    mask=h_mask,
+                    other=0.0,
+                ).to(gl.float32)
+                route_vals += hidden * wd
+
+            gl.store(result_values + row_offset * H + offs_h, route_vals, mask=active & h_mask)
+
+            done = gl.atomic_add(compute_done + count_idx, 1, sem="release", scope="gpu") + 1
+            if done == EC:
+                published_count = gl.load(dispatch_counts + count_idx)
+                published_count = gl.minimum(published_count, published_count * 0 + EC)
+                gl.store(result_counts + count_idx, published_count)
+                if source_pe == my_pe:
+                    gl.store(result_signals + count_idx, epoch_u64)
+                else:
+                    gl.store(result_signals + count_idx, epoch_u64)
+                    rocshmem.putmem_wg(
+                        result_counts + count_idx,
+                        result_counts + count_idx,
+                        4,
+                        source_pe,
+                    )
+                    rocshmem.putmem_wg(
+                        result_values + count_idx * EC * H,
+                        result_values + count_idx * EC * H,
+                        EC * H * 4,
+                        source_pe,
+                    )
+                    rocshmem.putmem_wg(
+                        result_signals + count_idx,
+                        result_signals + count_idx,
+                        8,
+                        source_pe,
+                    )
+                    rocshmem.quiet()
+            task_id = _processor_next_task(processor_ready, processor_mailboxes)
+
+    _global_barrier(barriers, 5, NUM_PROGRAMS)
+
+    if pid == 0:
+        rocshmem.barrier_all()
+        if WORLD == 2:
+            owner_pe_fetch = 1 - my_pe
+            fetch_channel = (owner_pe_fetch * WORLD + my_pe) * NLX
+            for lx in gl.static_range(0, NLX):
+                channel_idx = fetch_channel + lx
+                rocshmem.getmem_wg(
+                    result_counts + channel_idx,
+                    result_counts + channel_idx,
+                    4,
+                    owner_pe_fetch,
+                )
+                rocshmem.getmem_wg(
+                    result_values + channel_idx * EC * H,
+                    result_values + channel_idx * EC * H,
+                    EC * H * 4,
+                    owner_pe_fetch,
+                )
+            rocshmem.quiet()
+    _persistent_phase_barrier(barriers, 6, NUM_PROGRAMS)
+
+    combine_task = pid
+    while combine_task < WORLD * NLX * EC:
+        owner_pe = combine_task // (NLX * EC)
+        rem_c = combine_task - owner_pe * NLX * EC
+        local_expert = rem_c // EC
+        slot = rem_c - local_expert * EC
+        count_idx = (owner_pe * WORLD + my_pe) * NLX + local_expert
+        active = slot < gl.load(result_counts + count_idx)
+        row_offset = count_idx * EC + slot
+        token_id_out = gl.load(dispatch_token_ids + row_offset, mask=active, other=0)
+        prob = gl.load(dispatch_probs + row_offset, mask=active, other=0.0).to(gl.float32)
+        vals = gl.load(result_values + row_offset * H + offs_h, mask=active & h_mask, other=0.0).to(gl.float32)
+        gl.atomic_add(
+            output + token_id_out * H + offs_h,
+            prob * vals,
+            sem="relaxed",
+            scope="gpu",
+            mask=active & h_mask,
+        )
+        combine_task += NUM_PROGRAMS
+
+    _persistent_phase_barrier(barriers, 7, NUM_PROGRAMS)
+    if pid == 0:
+        rocshmem.barrier_all()
+    _global_barrier(barriers, 8, NUM_PROGRAMS)
+
+
 @gluon.jit
 def _single_dispatch_moe_kernel(
     tokens,
@@ -1699,6 +2046,131 @@ def forward_megakernel(
     return out
 
 
+def forward_megakernel_rocshmem(
+    tokens: torch.Tensor,
+    gate_weights: torch.Tensor,
+    local_expert_up: torch.Tensor,
+    local_expert_down: torch.Tensor,
+    bias_up: torch.Tensor,
+    bias_down: torch.Tensor,
+    *,
+    ctx,
+    top_k: int,
+    activation: int = ACT_IDENTITY,
+    local_expert_up_v: Optional[torch.Tensor] = None,
+    bias_up_v: Optional[torch.Tensor] = None,
+    block_h: Optional[int] = None,
+    num_warps: int = 4,
+    num_programs: int = 2,
+) -> torch.Tensor:
+    if tokens.ndim != 2 or gate_weights.ndim != 2:
+        raise ValueError("tokens must be [S,H] and gate_weights must be [H,E]")
+    if local_expert_up.ndim != 3 or local_expert_down.ndim != 3:
+        raise ValueError("local expert weights must be [local_experts,H,I] and [local_experts,I,H]")
+    if tokens.device.type != "cuda":
+        raise ValueError("rocSHMEM Gluon megakernel expects device tensors")
+    if tokens.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("rocSHMEM Gluon megakernel expects fp16 or bf16 tokens")
+    if top_k not in (1, 2):
+        raise ValueError("rocSHMEM Gluon megakernel currently supports top_k in {1, 2}")
+    if activation not in (ACT_IDENTITY, ACT_SILU, ACT_GELU, ACT_RELU):
+        raise ValueError("unsupported activation")
+    if num_programs < 2:
+        raise ValueError("rocSHMEM persistent scheduling requires at least two programs")
+    if num_warps not in (4, 8):
+        raise ValueError("gfx1250 Gluon path currently expects num_warps in {4, 8}")
+
+    s, h = tokens.shape
+    hw, e = gate_weights.shape
+    nlx, hup, i = local_expert_up.shape
+    nd, idown, hdown = local_expert_down.shape
+    if hw != h or (nd, idown, hdown) != (nlx, i, h) or hup != h:
+        raise ValueError("distributed token, gate, and local expert tensor shapes are inconsistent")
+    if bias_up.shape != (nlx, i) or bias_down.shape != (nlx, h):
+        raise ValueError("distributed bias tensor shapes are inconsistent")
+    if e != ctx.world_size * ctx.local_experts or nlx != ctx.local_experts:
+        raise ValueError("gate expert count must equal world_size * local_experts")
+    if ctx.expert_capacity <= 0 or ctx.hidden_size != h or ctx.dtype != tokens.dtype:
+        raise ValueError("rocSHMEM context does not match token dtype/hidden size")
+    if gate_weights.dtype != tokens.dtype or local_expert_up.dtype != tokens.dtype or local_expert_down.dtype != tokens.dtype:
+        raise ValueError("tokens, gate weights, and local expert weights must have the same dtype")
+    if bias_up.dtype != tokens.dtype or bias_down.dtype != tokens.dtype:
+        raise ValueError("bias tensors must have the same dtype as tokens")
+
+    gated = local_expert_up_v is not None
+    if gated:
+        if bias_up_v is None:
+            raise ValueError("bias_up_v is required when local_expert_up_v is provided")
+        if local_expert_up_v.shape != local_expert_up.shape or bias_up_v.shape != bias_up.shape:
+            raise ValueError("gated local expert tensors must match the up projection shapes")
+        if local_expert_up_v.dtype != tokens.dtype or bias_up_v.dtype != tokens.dtype:
+            raise ValueError("gated tensors must have the same dtype as tokens")
+    elif bias_up_v is not None:
+        raise ValueError("bias_up_v requires local_expert_up_v")
+
+    resolved_block_h = _next_power_of_2(h) if block_h is None else block_h
+    if resolved_block_h < h:
+        raise ValueError("block_h must cover the full hidden dimension")
+    up_v_arg = local_expert_up_v if local_expert_up_v is not None else local_expert_up
+    bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
+
+    ctx.zero_()
+    rocshmem.register_kernel(_persistent_rocshmem_scalar_kernel)
+    rocshmem.install_module_init(ctx.runtime)
+
+    out = torch.empty((s, h), device=tokens.device, dtype=torch.float32)
+    compute_done = torch.empty((ctx.world_size * ctx.world_size, ctx.local_experts), device=tokens.device, dtype=torch.int32)
+    processor_ready = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
+    processor_mailboxes = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
+    barriers = torch.empty((9,), device=tokens.device, dtype=torch.int32)
+    init_flag = torch.zeros((1,), device=tokens.device, dtype=torch.int32)
+    launch_epoch = 1
+    block_e = max(16, _next_power_of_2(e))
+
+    _persistent_rocshmem_scalar_kernel[(num_programs,)](
+        tokens,
+        gate_weights,
+        local_expert_up,
+        bias_up,
+        up_v_arg,
+        bias_up_v_arg,
+        local_expert_down,
+        bias_down,
+        out,
+        ctx.dispatch_tokens,
+        ctx.dispatch_token_ids,
+        ctx.dispatch_probs,
+        ctx.dispatch_counts,
+        ctx.dispatch_signals,
+        ctx.result_values,
+        ctx.result_counts,
+        ctx.result_signals,
+        compute_done,
+        processor_ready,
+        processor_mailboxes,
+        barriers,
+        init_flag,
+        launch_epoch,
+        S=s,
+        H=h,
+        I=i,
+        E=e,
+        WORLD=ctx.world_size,
+        NLX=ctx.local_experts,
+        EC=ctx.expert_capacity,
+        TOP_K=top_k,
+        BLOCK_E=block_e,
+        BLOCK_H=resolved_block_h,
+        ACTIVATION=activation,
+        GATED=gated,
+        NUM_PROGRAMS=num_programs,
+        NUM_WARPS=num_warps,
+        num_warps=num_warps,
+        extern_libs=rocshmem.extern_libs("gfx1250"),
+    )
+    return out
+
+
 __all__ = [
     "ACT_IDENTITY",
     "ACT_SILU",
@@ -1706,5 +2178,6 @@ __all__ = [
     "ACT_RELU",
     "MegakernelSpec",
     "forward_megakernel",
+    "forward_megakernel_rocshmem",
     "forward_scalar_top1_debug",
 ]

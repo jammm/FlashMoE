@@ -67,10 +67,53 @@ def launch_kwargs(arch: str = "gfx1250") -> dict[str, dict[str, str]]:
     return {"extern_libs": extern_libs(arch)}
 
 
-def _dispatch(lib_name: str, lib_path: str, args: list, arg_type_symbol_dict: dict, is_pure: bool, _semantic):
+_ROCSHMEM_KERNEL_NAMES: set[str] = set()
+_PREVIOUS_POST_COMPILE_HOOK = None
+
+
+def register_kernel(jit_func_or_name) -> None:
+    name = jit_func_or_name if isinstance(jit_func_or_name, str) else jit_func_or_name.fn.__name__
+    _ROCSHMEM_KERNEL_NAMES.add(name)
+
+
+def install_module_init(runtime) -> None:
+    import triton
+
+    global _PREVIOUS_POST_COMPILE_HOOK
+    previous = triton.knobs.runtime.jit_post_compile_hook
+    if previous is not _module_init_hook:
+        _PREVIOUS_POST_COMPILE_HOOK = previous
+    _module_init_hook.runtime = runtime
+    triton.knobs.runtime.jit_post_compile_hook = _module_init_hook
+
+
+def _module_init_hook(**kwargs):
+    if _PREVIOUS_POST_COMPILE_HOOK is not None:
+        _PREVIOUS_POST_COMPILE_HOOK(**kwargs)
+    jit_function = kwargs["fn"].jit_function
+    fn_name = jit_function.fn.__name__
+    if fn_name not in _ROCSHMEM_KERNEL_NAMES:
+        return
+    device = kwargs["compile"]["device"]
+    key = kwargs["key"]
+    kernel = jit_function.device_caches[device][0].get(key)
+    if kernel is None:
+        raise RuntimeError(f"compiled kernel for {fn_name} was not found in the Triton device cache")
+    kernel.run
+    runtime = getattr(_module_init_hook, "runtime", None)
+    if runtime is None:
+        raise RuntimeError("rocSHMEM module init hook installed without a runtime")
+    runtime.hipmodule_init(int(kernel.module))
+
+
+def _dispatch(lib_name: str, lib_path: str, args: list, arg_type_symbol_dict, is_pure: bool, _semantic):
     if not arg_type_symbol_dict:
         raise ValueError("arg_type_symbol_dict is empty")
-    num_args = len(next(iter(arg_type_symbol_dict.keys())))
+    if isinstance(arg_type_symbol_dict, dict):
+        cases = tuple(arg_type_symbol_dict.items())
+    else:
+        cases = tuple(arg_type_symbol_dict)
+    num_args = len(cases[0][0])
     if len(args) != num_args:
         raise ValueError(f"extern call expected {num_args} args, got {len(args)}")
 
@@ -84,28 +127,33 @@ def _dispatch(lib_name: str, lib_path: str, args: list, arg_type_symbol_dict: di
             arg_types.append(type(arg))
             arg_handles.append(arg)
     arg_types = tuple(arg_types)
-    if arg_types not in arg_type_symbol_dict:
-        raise ValueError(f"extern call type mismatch: expected {tuple(arg_type_symbol_dict.keys())}, got {arg_types}")
+    match = None
+    for expected_types, value in cases:
+        if arg_types == expected_types:
+            match = value
+            break
+    if match is None:
+        expected = tuple(expected_types for expected_types, _ in cases)
+        raise ValueError(f"extern call type mismatch: expected {expected}, got {arg_types}")
 
-    symbol, ret_types = arg_type_symbol_dict[arg_types]
+    symbol, ret_types = match
     if not isinstance(ret_types, (list, tuple)):
         ret_types = [ret_types]
     if not symbol:
         raise ValueError("extern call symbol cannot be empty")
 
-    call = _semantic.builder.create_extern_call(
+    if len(ret_types) != 1:
+        raise ValueError("Gluon rocSHMEM extern calls currently expect one return value")
+    ret_type = ret_types[0]
+    call = _semantic.builder.create_extern_elementwise(
         lib_name,
         lib_path,
         symbol,
         arg_handles,
-        [ret_type.to_ir(_semantic.builder) for ret_type in ret_types],
+        ret_type.to_ir(_semantic.builder),
         is_pure,
     )
-    if len(ret_types) == 0:
-        return tensor(call, gl.void)
-    if len(ret_types) == 1:
-        return tensor(call.get_result(0), ret_types[0])
-    return tuple(tensor(call.get_result(i), ty) for i, ty in enumerate(ret_types))
+    return tensor(call, ret_type)
 
 
 @builtin
@@ -158,7 +206,7 @@ def remote_ptr(local_ptr, pe, _semantic=None):
             gl.cast(local_ptr, _VOID_PTR, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {(_VOID_PTR, gl.int32): ("rocshmem_ptr", _VOID_PTR)},
+        (((_VOID_PTR, gl.int32), ("rocshmem_ptr", _VOID_PTR)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -176,7 +224,7 @@ def putmem_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {(_VOID_PTR, _VOID_PTR, gl.int64, gl.int32): ("rocshmem_putmem_wg", gl.int32)},
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_putmem_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -193,7 +241,7 @@ def putmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {(_VOID_PTR, _VOID_PTR, gl.int64, gl.int32): ("rocshmem_putmem_nbi_wg", gl.int32)},
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_putmem_nbi_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -210,7 +258,7 @@ def getmem_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {(_VOID_PTR, _VOID_PTR, gl.int64, gl.int32): ("rocshmem_getmem_wg", gl.int32)},
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_getmem_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -227,7 +275,7 @@ def getmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {(_VOID_PTR, _VOID_PTR, gl.int64, gl.int32): ("rocshmem_getmem_nbi_wg", gl.int32)},
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_getmem_nbi_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -247,12 +295,12 @@ def putmem_signal_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semant
             gl.cast(sig_op, gl.int32, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {
-            (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32): (
-                "rocshmem_putmem_signal_wg",
-                gl.int32,
-            )
-        },
+        (
+            (
+                (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32),
+                ("rocshmem_putmem_signal_wg", gl.int32),
+            ),
+        ),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -272,12 +320,12 @@ def putmem_signal_nbi_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _se
             gl.cast(sig_op, gl.int32, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        {
-            (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32): (
-                "rocshmem_putmem_signal_nbi_wg",
-                gl.int32,
-            )
-        },
+        (
+            (
+                (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32),
+                ("rocshmem_putmem_signal_nbi_wg", gl.int32),
+            ),
+        ),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -293,7 +341,7 @@ def signal_wait_until(sig_addr, cmp_op, cmp_val, _semantic=None):
             gl.cast(cmp_op, gl.int32, _semantic=_semantic),
             gl.cast(cmp_val, gl.uint64, _semantic=_semantic),
         ],
-        {(_U64_PTR, gl.int32, gl.uint64): ("rocshmem_uint64_wait_until", gl.int32)},
+        (((_U64_PTR, gl.int32, gl.uint64), ("rocshmem_uint64_wait_until", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -359,6 +407,8 @@ __all__ = [
     "extern_libs",
     "find_device_bitcode",
     "launch_kwargs",
+    "register_kernel",
+    "install_module_init",
     "set_ctx",
     "my_pe",
     "n_pes",
