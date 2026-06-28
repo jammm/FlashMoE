@@ -1,3 +1,34 @@
+# Gluon FlashMoE megakernel overview
+#
+# This file contains two separate implementation surfaces:
+#
+# 1. Local single-rank Gluon kernels used for performance work:
+#    - validate host tensors and resolve a MegakernelSpec;
+#    - route tokens either inside the kernel from gate weights or from a
+#      precomputed top-k table;
+#    - compact routed tokens into expert-major slots with atomic counters;
+#    - run GEMM0 (token x up), optional gated activation, GEMM1 (hidden x down)
+#      through the TDM/WMMA warp-specialized tile helpers below;
+#    - combine routed expert outputs back into the final token-major output.
+#
+# 2. An experimental Gluon rocSHMEM path:
+#    - dispatches token packets across PEs with rocSHMEM puts/signals;
+#    - schedules GEMM and combine work from one OS-like program and several
+#      compute programs;
+#    - uses R_EC as the padded storage capacity and EC as the logical routed
+#      token cap.
+#    This path is deliberately guarded at the public entry point because its
+#    queue/signal protocol is not yet paper/CUDA/HIP parity. The distributed
+#    parity baseline is the HIP backend under flashmoe_hip, which wraps the
+#    paper scheduler/subscriber/symHeap/TQSignal implementation.
+#
+# Layout of this file:
+# - host-side spec validation and launch heuristics
+# - Gluon layout, activation, barrier, and TDM/WMMA tile helpers
+# - local task schedulers and local persistent kernels
+# - experimental rocSHMEM helpers and persistent kernel
+# - Python entry points
+
 from __future__ import annotations
 
 import os
@@ -13,6 +44,10 @@ from triton.experimental.gluon.language.amd.gfx1250 import mbarrier, tdm
 
 from . import rocshmem
 
+
+# ---------------------------------------------------------------------------
+# Host-side constants, shape spec, and launch policy
+# ---------------------------------------------------------------------------
 
 ACT_IDENTITY = 0
 ACT_SILU = 1
@@ -185,6 +220,10 @@ def _validate_common(
     )
 
 
+# ---------------------------------------------------------------------------
+# Gluon layout and scalar helpers
+# ---------------------------------------------------------------------------
+
 @gluon.constexpr_function
 def _hidden_layout(num_warps):
     return gl.BlockedLayout([1], [32], [num_warps], [0], [])
@@ -224,6 +263,10 @@ def _apply_activation(x, ACTIVATION: gl.constexpr):
         return x * (1.0 / (1.0 + gl.exp(-x)))
     return 0.5 * x * (1.0 + gl.erf(x * 0.7071067811865476))
 
+
+# ---------------------------------------------------------------------------
+# Debug and synchronization primitives
+# ---------------------------------------------------------------------------
 
 @gluon.jit
 def _single_dispatch_top1_debug_kernel(
@@ -315,7 +358,6 @@ def _persistent_phase_barrier(
     _global_barrier(barriers, phase, NUM_PROGRAMS)
 
 
-
 @gluon.aggregate
 class _WsPhaseCounter:
     iteration: gl.tensor
@@ -339,6 +381,10 @@ class _WsPhaseCounter:
     def next(self):
         return _WsPhaseCounter(self.iteration + 1, self.num_barriers)
 
+
+# ---------------------------------------------------------------------------
+# Local TDM/WMMA tile helpers
+# ---------------------------------------------------------------------------
 
 @gluon.jit
 def _init_ws_load_mbarriers(
@@ -742,7 +788,9 @@ def _gemm1_ws_epilogue(
     mbarrier.arrive(acc_empty_bar, count=1)
 
 
-
+# The channel helpers are used only by the experimental rocSHMEM kernel.
+# `EC` is the logical routed-token cap carried in signal payloads; `R_EC` is
+# the BLOCK_M-rounded storage stride, matching HIP's roundEC layout.
 @gluon.jit
 def _gemm0_channel_ws_producer(
     dispatch_tokens,
@@ -762,7 +810,7 @@ def _gemm0_channel_ws_producer(
     base_i,
     H: gl.constexpr,
     I: gl.constexpr,
-    EC: gl.constexpr,
+    R_EC: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -779,8 +827,8 @@ def _gemm0_channel_ws_producer(
         ready_bar = load_ready_bars.index(buffer_idx)
         mbarrier.wait(empty_bar, empty_counter.phase())
         x_desc = tdm.make_tensor_descriptor(
-            base=dispatch_tokens + count_idx * EC * H + h_tile * BLOCK_N,
-            shape=(EC, BLOCK_N),
+            base=dispatch_tokens + count_idx * R_EC * H + h_tile * BLOCK_N,
+            shape=(R_EC, BLOCK_N),
             strides=(H, 1),
             block_shape=(BLOCK_M, BLOCK_N),
             layout=shared_a_layout,
@@ -806,8 +854,8 @@ def _gemm0_channel_ws_producer(
             ready_bar_v = v_load_ready_bars.index(buffer_idx_v)
             mbarrier.wait(empty_bar_v, v_empty_counter.phase())
             xv_desc = tdm.make_tensor_descriptor(
-                base=dispatch_tokens + count_idx * EC * H + h_tile_v * BLOCK_N,
-                shape=(EC, BLOCK_N),
+                base=dispatch_tokens + count_idx * R_EC * H + h_tile_v * BLOCK_N,
+                shape=(R_EC, BLOCK_N),
                 strides=(H, 1),
                 block_shape=(BLOCK_M, BLOCK_N),
                 layout=shared_a_layout,
@@ -837,7 +885,7 @@ def _gemm1_channel_ws_producer(
     local_expert,
     base_slot,
     base_h,
-    EC: gl.constexpr,
+    R_EC: gl.constexpr,
     I: gl.constexpr,
     H: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -848,8 +896,8 @@ def _gemm1_channel_ws_producer(
 ):
     empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
     hidden_desc = tdm.make_tensor_descriptor(
-        base=hidden + hidden_channel * EC * I,
-        shape=(EC, I),
+        base=hidden + hidden_channel * R_EC * I,
+        shape=(R_EC, I),
         strides=(I, 1),
         block_shape=(BLOCK_M, BLOCK_N),
         layout=shared_h_layout,
@@ -891,6 +939,7 @@ def _gemm1_channel_result_epilogue(
     base_slot,
     base_h,
     EC: gl.constexpr,
+    R_EC: gl.constexpr,
     H: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -915,12 +964,16 @@ def _gemm1_channel_result_epilogue(
     active_rows = gl.convert_layout(active_route_rows, row_layout)
     rows_2d = gl.expand_dims(route_rows, 1)
     cols_2d = gl.expand_dims(offs_out, 0)
-    result_offsets = gl.convert_layout((count_idx * EC + rows_2d) * H + cols_2d, wmma_layout)
+    result_offsets = gl.convert_layout((count_idx * R_EC + rows_2d) * H + cols_2d, wmma_layout)
     active_2d = gl.convert_layout(gl.expand_dims(active_rows, 1), wmma_layout)
     gl.store(result_values + result_offsets, acc.to(result_values.dtype.element_ty), mask=active_2d)
     gl.atomic_add(dispatch_counts + count_idx, 0, sem="release", scope="gpu")
     mbarrier.arrive(acc_empty_bar, count=1)
 
+
+# ---------------------------------------------------------------------------
+# Local task queues and scheduler helpers
+# ---------------------------------------------------------------------------
 
 @gluon.jit
 def _scheduler_reset(processor_ready, processor_mailboxes, NUM_PROGRAMS: gl.constexpr):
@@ -1156,6 +1209,14 @@ def _wait_loadcnt0():
     )
 
 
+# ---------------------------------------------------------------------------
+# Experimental rocSHMEM protocol helpers
+# ---------------------------------------------------------------------------
+#
+# These helpers are retained for isolated Gluon debugging only. They use a
+# compact epoch/count signal and a Python-allocated channel layout, not the
+# HIP paper path's SignalPayload, symHeap, task queues, and subscriber bitsets.
+
 @gluon.jit
 def _load_u64_acquire(ptr):
     return rocshmem.signal_fetch_wave(ptr)
@@ -1314,6 +1375,7 @@ def _init_rocshmem_dynamic_state(
         gl.atomic_xchg(tasks_done, 0, sem="release", scope="gpu")
         gl.atomic_xchg(os_done, 0, sem="release", scope="gpu")
         gl.atomic_xchg(dispatch_done, 0, sem="release", scope="gpu")
+        _wait_storecnt0()
 
 
 @gluon.jit
@@ -1326,6 +1388,7 @@ def _publish_result_channel_wave(
     my_pe,
     epoch_u64,
     EC: gl.constexpr,
+    R_EC: gl.constexpr,
     H: gl.constexpr,
     RESULT_ELEM_BYTES: gl.constexpr,
 ):
@@ -1352,9 +1415,9 @@ def _publish_result_channel_wave(
             )
             rocshmem.fence()
             rocshmem.putmem_signal_wave(
-                result_values + count_idx * EC * H,
-                result_values + count_idx * EC * H,
-                EC * H * RESULT_ELEM_BYTES,
+                result_values + count_idx * R_EC * H,
+                result_values + count_idx * R_EC * H,
+                published_count.to(gl.int64) * H * RESULT_ELEM_BYTES,
                 result_signals + count_idx,
                 payload,
                 rocshmem.ROCSHMEM_SIGNAL_SET,
@@ -1385,6 +1448,7 @@ def _rocshmem_os_subscriber_publisher(
     WORLD: gl.constexpr,
     NLX: gl.constexpr,
     EC: gl.constexpr,
+    R_EC: gl.constexpr,
     H: gl.constexpr,
     I: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -1394,16 +1458,33 @@ def _rocshmem_os_subscriber_publisher(
 ):
     epoch_u64 = gl.full((), launch_epoch, gl.uint64)
     epoch_base = _signal_epoch_base(epoch_u64)
-    route_blocks: gl.constexpr = (EC + BLOCK_M - 1) // BLOCK_M
+    route_blocks: gl.constexpr = (R_EC + BLOCK_M - 1) // BLOCK_M
     h_tiles: gl.constexpr = H // BLOCK_N
     i_tiles: gl.constexpr = I // BLOCK_N
     total_channels: gl.constexpr = WORLD * NLX
+    gl.static_assert(total_channels <= 512, "rocSHMEM Gluon visited bitsets currently cover up to 512 local channels")
     gemm0_tasks: gl.constexpr = total_channels * route_blocks * i_tiles
     gemm1_tasks: gl.constexpr = total_channels * route_blocks * h_tiles
     combine_base: gl.constexpr = gemm0_tasks + gemm1_tasks
 
     dispatch_seen_count = gl.program_id(0) * 0
     result_seen_count = gl.program_id(0) * 0
+    dispatch_seen_mask0 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask1 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask2 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask3 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask4 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask5 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask6 = gl.full((), 0, gl.uint64)
+    dispatch_seen_mask7 = gl.full((), 0, gl.uint64)
+    result_seen_mask0 = gl.full((), 0, gl.uint64)
+    result_seen_mask1 = gl.full((), 0, gl.uint64)
+    result_seen_mask2 = gl.full((), 0, gl.uint64)
+    result_seen_mask3 = gl.full((), 0, gl.uint64)
+    result_seen_mask4 = gl.full((), 0, gl.uint64)
+    result_seen_mask5 = gl.full((), 0, gl.uint64)
+    result_seen_mask6 = gl.full((), 0, gl.uint64)
+    result_seen_mask7 = gl.full((), 0, gl.uint64)
     publish_head = gl.program_id(0) * 0
     finished = gl.program_id(0) * 0
     debug_iter = gl.program_id(0) * 0
@@ -1418,10 +1499,44 @@ def _rocshmem_os_subscriber_publisher(
             source_pe = my_pe * 0 + source_pe_static
             for lx in gl.static_range(0, NLX):
                 seen_idx = source_pe_static * NLX + lx
-                if gl.load(dispatch_seen + seen_idx) == 0:
+                bit = gl.full((), 1, gl.uint64) << (seen_idx % 64)
+                dispatch_seen_before = dispatch_seen_mask0 & bit
+                if seen_idx < 64:
+                    dispatch_seen_before = dispatch_seen_mask0 & bit
+                elif seen_idx < 128:
+                    dispatch_seen_before = dispatch_seen_mask1 & bit
+                elif seen_idx < 192:
+                    dispatch_seen_before = dispatch_seen_mask2 & bit
+                elif seen_idx < 256:
+                    dispatch_seen_before = dispatch_seen_mask3 & bit
+                elif seen_idx < 320:
+                    dispatch_seen_before = dispatch_seen_mask4 & bit
+                elif seen_idx < 384:
+                    dispatch_seen_before = dispatch_seen_mask5 & bit
+                elif seen_idx < 448:
+                    dispatch_seen_before = dispatch_seen_mask6 & bit
+                else:
+                    dispatch_seen_before = dispatch_seen_mask7 & bit
+                if dispatch_seen_before == 0:
                     count_idx = (my_pe * WORLD + source_pe) * NLX + lx
                     signal = _load_u64_acquire(dispatch_signals + count_idx)
                     if signal >= epoch_base:
+                        if seen_idx < 64:
+                            dispatch_seen_mask0 = dispatch_seen_mask0 | bit
+                        elif seen_idx < 128:
+                            dispatch_seen_mask1 = dispatch_seen_mask1 | bit
+                        elif seen_idx < 192:
+                            dispatch_seen_mask2 = dispatch_seen_mask2 | bit
+                        elif seen_idx < 256:
+                            dispatch_seen_mask3 = dispatch_seen_mask3 | bit
+                        elif seen_idx < 320:
+                            dispatch_seen_mask4 = dispatch_seen_mask4 | bit
+                        elif seen_idx < 384:
+                            dispatch_seen_mask5 = dispatch_seen_mask5 | bit
+                        elif seen_idx < 448:
+                            dispatch_seen_mask6 = dispatch_seen_mask6 | bit
+                        else:
+                            dispatch_seen_mask7 = dispatch_seen_mask7 | bit
                         gl.store(dispatch_seen + seen_idx, 1)
                         dispatch_seen_count += 1
                         channel_count = _signal_count(signal, epoch_u64)
@@ -1440,6 +1555,7 @@ def _rocshmem_os_subscriber_publisher(
                                 my_pe,
                                 epoch_u64,
                                 EC,
+                                R_EC,
                                 H,
                                 RESULT_ELEM_BYTES,
                             )
@@ -1472,6 +1588,7 @@ def _rocshmem_os_subscriber_publisher(
                     my_pe,
                     epoch_u64,
                     EC,
+                    R_EC,
                     H,
                     RESULT_ELEM_BYTES,
                 )
@@ -1482,10 +1599,44 @@ def _rocshmem_os_subscriber_publisher(
             owner_pe = my_pe * 0 + owner_pe_static
             for lx_res in gl.static_range(0, NLX):
                 seen_idx_res = owner_pe_static * NLX + lx_res
-                if gl.load(result_seen + seen_idx_res) == 0:
+                bit_res = gl.full((), 1, gl.uint64) << (seen_idx_res % 64)
+                result_seen_before = result_seen_mask0 & bit_res
+                if seen_idx_res < 64:
+                    result_seen_before = result_seen_mask0 & bit_res
+                elif seen_idx_res < 128:
+                    result_seen_before = result_seen_mask1 & bit_res
+                elif seen_idx_res < 192:
+                    result_seen_before = result_seen_mask2 & bit_res
+                elif seen_idx_res < 256:
+                    result_seen_before = result_seen_mask3 & bit_res
+                elif seen_idx_res < 320:
+                    result_seen_before = result_seen_mask4 & bit_res
+                elif seen_idx_res < 384:
+                    result_seen_before = result_seen_mask5 & bit_res
+                elif seen_idx_res < 448:
+                    result_seen_before = result_seen_mask6 & bit_res
+                else:
+                    result_seen_before = result_seen_mask7 & bit_res
+                if result_seen_before == 0:
                     count_idx_res = (owner_pe * WORLD + my_pe) * NLX + lx_res
                     signal_res = _load_u64_acquire(result_signals + count_idx_res)
                     if signal_res >= epoch_base:
+                        if seen_idx_res < 64:
+                            result_seen_mask0 = result_seen_mask0 | bit_res
+                        elif seen_idx_res < 128:
+                            result_seen_mask1 = result_seen_mask1 | bit_res
+                        elif seen_idx_res < 192:
+                            result_seen_mask2 = result_seen_mask2 | bit_res
+                        elif seen_idx_res < 256:
+                            result_seen_mask3 = result_seen_mask3 | bit_res
+                        elif seen_idx_res < 320:
+                            result_seen_mask4 = result_seen_mask4 | bit_res
+                        elif seen_idx_res < 384:
+                            result_seen_mask5 = result_seen_mask5 | bit_res
+                        elif seen_idx_res < 448:
+                            result_seen_mask6 = result_seen_mask6 | bit_res
+                        else:
+                            result_seen_mask7 = result_seen_mask7 | bit_res
                         gl.store(result_seen + seen_idx_res, 1)
                         result_seen_count += 1
                         result_count = _signal_count(signal_res, epoch_u64)
@@ -1505,15 +1656,8 @@ def _rocshmem_os_subscriber_publisher(
                                     h_tile_res += 1
                                 route_block_res += 1
 
-        dispatch_seen_total = gl.program_id(0) * 0
-        result_seen_total = gl.program_id(0) * 0
-        for source_pe_done_static in gl.static_range(0, WORLD):
-            for lx_done in gl.static_range(0, NLX):
-                seen_done_idx = source_pe_done_static * NLX + lx_done
-                if gl.load(dispatch_seen + seen_done_idx) != 0:
-                    dispatch_seen_total += 1
-                if gl.load(result_seen + seen_done_idx) != 0:
-                    result_seen_total += 1
+        dispatch_seen_total = dispatch_seen_count
+        result_seen_total = result_seen_count
 
         publish_tail_done = gl.atomic_add(publish_tail, 0, sem="acquire", scope="gpu")
         bound = gl.atomic_add(task_bound, 0, sem="acquire", scope="gpu")
@@ -1533,6 +1677,10 @@ def _rocshmem_os_subscriber_publisher(
         if finished == 0:
             _gpu_relax()
 
+
+# ---------------------------------------------------------------------------
+# Processor mailbox consumers
+# ---------------------------------------------------------------------------
 
 @gluon.jit
 def _processor_next_task(processor_ready, processor_mailboxes):
@@ -1713,6 +1861,10 @@ def _processor_next_task_generation(processor_ready, processor_mailboxes, proces
     task = signal - 1
     return task
 
+
+# ---------------------------------------------------------------------------
+# Local persistent kernels
+# ---------------------------------------------------------------------------
 
 @gluon.jit
 def _persistent_dispatch_moe_kernel(
@@ -1903,6 +2055,7 @@ def _persistent_dispatch_moe_kernel(
     _global_barrier(barriers, 3, NUM_PROGRAMS)
 
 
+# Shared argument bundle for the local warp-specialized TDM/WMMA kernel.
 @gluon.aggregate
 class _LocalWsArgs:
     tokens: gl.tensor
@@ -2323,6 +2476,9 @@ def _local_ws_producer_loop_p(p):
         gl.store(p.debug_state + 16 + pid, 800)
 
 
+# Local TDM/WMMA megakernel:
+# program 0 initializes and schedules work; other programs route tokens, run
+# GEMM0/GEMM1 tiles through the warp-specialized helpers, then combine output.
 @gluon.jit
 def _persistent_tdm_wmma_kernel(
     tokens,
@@ -2656,8 +2812,8 @@ def _persistent_tdm_wmma_kernel(
         gl.store(debug_state + pid, 999)
 
 
-
-
+# Experimental distributed Gluon megakernel. This is not the paper/CUDA parity
+# path; the public Python wrapper is opt-in guarded for that reason.
 @gluon.jit
 def _persistent_rocshmem_tdm_wmma_kernel(
     tokens,
@@ -2704,6 +2860,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
     WORLD: gl.constexpr,
     NLX: gl.constexpr,
     EC: gl.constexpr,
+    R_EC: gl.constexpr,
     TOP_K: gl.constexpr,
     BLOCK_E: gl.constexpr,
     BLOCK_H: gl.constexpr,
@@ -2751,7 +2908,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
 
     local_channels: gl.constexpr = WORLD * NLX
     all_channels: gl.constexpr = WORLD * WORLD * NLX
-    route_blocks: gl.constexpr = (EC + BLOCK_M - 1) // BLOCK_M
+    route_blocks: gl.constexpr = (R_EC + BLOCK_M - 1) // BLOCK_M
     h_tiles: gl.constexpr = H // BLOCK_N
     i_tiles: gl.constexpr = I // BLOCK_N
     gemm0_tasks: gl.constexpr = local_channels * route_blocks * i_tiles
@@ -2852,6 +3009,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                     WORLD,
                     NLX,
                     EC,
+                    R_EC,
                     H,
                     I,
                     BLOCK_M,
@@ -2868,6 +3026,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
             while token_id < S:
                 zero_f = token_id.to(gl.float32) * 0.0
                 zero_i = token_id * 0
+
                 top0_idx = zero_i
                 top1_idx = zero_i
                 top0_logit = zero_f - float("inf")
@@ -2913,13 +3072,14 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                         slot = gl.atomic_add(dispatch_counts + count_idx, 1, sem="relaxed", scope="gpu")
                         active = slot < EC
                         safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
-                        route_offset = count_idx * EC + safe_slot
+                        route_offset = count_idx * R_EC + safe_slot
                         token_row = gl.load(tokens + token_id * H + offs_h, mask=h_mask, other=0.0)
                         gl.store(dispatch_token_ids + route_offset, token_id, mask=active)
                         gl.store(dispatch_probs + route_offset, route_prob, mask=active)
                         gl.store(dispatch_tokens + route_offset * H + offs_h, token_row, mask=active & h_mask)
                 token_id += DISPATCH_PROGRAMS
 
+            _wait_storecnt0()
             gl.barrier()
             done_dispatch = gl.atomic_add(dispatch_done, 1, sem="acq_rel", scope="gpu") + 1
             if done_dispatch == DISPATCH_PROGRAMS:
@@ -2951,22 +3111,22 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                     owner_pe_send,
                                 )
                                 rocshmem.putmem_nbi_wg(
-                                    dispatch_token_ids + channel_idx * EC,
-                                    dispatch_token_ids + channel_idx * EC,
-                                    EC * 4,
+                                    dispatch_token_ids + channel_idx * R_EC,
+                                    dispatch_token_ids + channel_idx * R_EC,
+                                    published_count.to(gl.int64) * 4,
                                     owner_pe_send,
                                 )
                                 rocshmem.putmem_nbi_wg(
-                                    dispatch_probs + channel_idx * EC,
-                                    dispatch_probs + channel_idx * EC,
-                                    EC * 4,
+                                    dispatch_probs + channel_idx * R_EC,
+                                    dispatch_probs + channel_idx * R_EC,
+                                    published_count.to(gl.int64) * 4,
                                     owner_pe_send,
                                 )
                                 rocshmem.quiet()
                                 rocshmem.putmem_signal_nbi_wg(
-                                    dispatch_tokens + channel_idx * EC * H,
-                                    dispatch_tokens + channel_idx * EC * H,
-                                    EC * H * 2,
+                                    dispatch_tokens + channel_idx * R_EC * H,
+                                    dispatch_tokens + channel_idx * R_EC * H,
+                                    published_count.to(gl.int64) * H * 2,
                                     dispatch_signals + channel_idx,
                                     payload,
                                     rocshmem.ROCSHMEM_SIGNAL_SET,
@@ -3066,7 +3226,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                 hidden_channel,
                                 base_slot,
                                 base_i,
-                                EC,
+                                R_EC,
                                 I,
                                 BLOCK_M,
                                 BLOCK_N,
@@ -3121,7 +3281,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                 base_i,
                                 H,
                                 I,
-                                EC,
+                                R_EC,
                                 BLOCK_M,
                                 BLOCK_N,
                                 NUM_BUFFERS,
@@ -3204,6 +3364,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                 base_slot,
                                 base_h,
                                 EC,
+                                R_EC,
                                 H,
                                 BLOCK_M,
                                 BLOCK_N,
@@ -3241,7 +3402,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                 local_expert,
                                 base_slot,
                                 base_h,
-                                EC,
+                                R_EC,
                                 I,
                                 H,
                                 BLOCK_M,
@@ -3285,7 +3446,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                     slot = base_slot + row
                     active = slot < result_count
                     safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
-                    row_offset = count_idx * EC + safe_slot
+                    row_offset = count_idx * R_EC + safe_slot
                     token_id_out = gl.load(dispatch_token_ids + row_offset, mask=active, other=0)
                     prob = gl.load(dispatch_probs + row_offset, mask=active, other=0.0).to(gl.float32)
                     vals = gl.load(result_values + row_offset * H + offs_out, mask=active & tile_mask, other=0.0).to(gl.float32)
@@ -3419,6 +3580,10 @@ def _single_dispatch_moe_kernel(
 
     gl.store(output + token_id * H + offs_h, out_vals, mask=h_mask)
 
+
+# ---------------------------------------------------------------------------
+# Python entry points
+# ---------------------------------------------------------------------------
 
 def forward_scalar_top1_debug(
     tokens: torch.Tensor,
@@ -3974,6 +4139,235 @@ def forward_megakernel_from_topk(
     return out
 
 
+# Host-side launcher for the experimental Gluon rocSHMEM kernel. The
+# rank-ordered warmup/module-init loop keeps rocSHMEM module registration
+# deterministic across processes; it is not a substitute for the HIP paper
+# scheduler/subscriber protocol.
+def _launch_rocshmem_megakernel(
+    tokens: torch.Tensor,
+    gate_weights: torch.Tensor,
+    local_expert_up: torch.Tensor,
+    local_expert_down: torch.Tensor,
+    bias_up: torch.Tensor,
+    bias_down: torch.Tensor,
+    *,
+    ctx,
+    top_k: int,
+    activation: int,
+    local_expert_up_v: Optional[torch.Tensor],
+    bias_up_v: Optional[torch.Tensor],
+    block_h: Optional[int],
+    num_warps: int,
+    num_programs: int,
+) -> torch.Tensor:
+    s, h = tokens.shape
+    nlx, _, i = local_expert_up.shape
+    e = ctx.world_size * ctx.local_experts
+    gated = local_expert_up_v is not None
+    host_trace = os.environ.get("FLASHMOE_HOST_TRACE", "0") == "1"
+
+    def _trace(message: str) -> None:
+        if host_trace:
+            print(f"flashmoe rocshmem rank={ctx.rank} {message}", flush=True)
+
+    resolved_block_h = _next_power_of_2(h) if block_h is None else block_h
+    if resolved_block_h < h:
+        raise ValueError("block_h must cover the full hidden dimension")
+    if h % 64 != 0 or i % 64 != 0:
+        raise ValueError("rocSHMEM Gluon megakernel requires H and I to be divisible by 64 for TDM/WMMA")
+    if num_warps != 4:
+        raise ValueError("rocSHMEM Gluon megakernel requires num_warps=4 for warp-specialized TDM/WMMA")
+
+    up_v_arg = local_expert_up_v if local_expert_up_v is not None else local_expert_up
+    bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
+
+    _trace("register-kernel")
+    rocshmem.register_kernel(_persistent_rocshmem_tdm_wmma_kernel)
+    rocshmem.install_module_init(ctx.runtime)
+
+    out = torch.empty((s, h), device=tokens.device, dtype=torch.float32)
+    block_m = 16
+    storage_capacity = int(getattr(ctx, "storage_capacity", _ceil_div(ctx.expert_capacity, block_m) * block_m))
+    if storage_capacity < ctx.expert_capacity or storage_capacity % block_m != 0:
+        raise ValueError("rocSHMEM context storage_capacity must be a BLOCK_M-aligned capacity >= expert_capacity")
+    hidden = torch.empty((ctx.world_size * ctx.local_experts, storage_capacity, i), device=tokens.device, dtype=tokens.dtype)
+    compute_done = torch.empty((ctx.world_size * ctx.world_size, ctx.local_experts), device=tokens.device, dtype=torch.int32)
+    route_blocks = _ceil_div(storage_capacity, block_m)
+    total_channels = ctx.world_size * ctx.local_experts
+    gemm0_tasks = total_channels * route_blocks * (i // 64)
+    gemm1_tasks = total_channels * route_blocks * (h // 64)
+    combine_tasks = total_channels * route_blocks * (h // 64)
+    total_tasks = gemm0_tasks + gemm1_tasks + combine_tasks
+    task_queue = torch.empty((total_tasks,), device=tokens.device, dtype=torch.int32)
+    task_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    publish_queue = torch.empty((total_channels,), device=tokens.device, dtype=torch.int32)
+    publish_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    tile_sync = torch.empty((total_channels * route_blocks,), device=tokens.device, dtype=torch.int32)
+    dispatch_seen = torch.empty((total_channels,), device=tokens.device, dtype=torch.int32)
+    result_seen = torch.empty((total_channels,), device=tokens.device, dtype=torch.int32)
+    task_bound = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    tasks_done = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    os_done = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    dispatch_done = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    processor_ready = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
+    processor_mailboxes = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
+    processor_seen = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
+    barriers = torch.empty((3,), device=tokens.device, dtype=torch.int32)
+    init_flag = torch.zeros((1,), device=tokens.device, dtype=torch.int32)
+    debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
+    progress_heartbeat = debug_trace_enabled
+    result_elem_bytes = torch.empty((), dtype=ctx.result_values.dtype).element_size()
+    debug_state = (
+        torch.zeros((64,), dtype=torch.int32, pin_memory=True)
+        if progress_heartbeat
+        else torch.zeros((1,), device=tokens.device, dtype=torch.int32)
+    )
+    setattr(forward_megakernel_rocshmem, "last_debug_state", debug_state if debug_trace_enabled else None)
+    launch_epoch = ctx.next_epoch()
+    block_e = max(16, _next_power_of_2(e))
+    _trace(f"prepared epoch={launch_epoch} ec={ctx.expert_capacity} storage_capacity={storage_capacity}")
+
+    for _preload_rank in range(ctx.world_size):
+        if ctx.rank == _preload_rank:
+            _trace(f"warmup-start owner={_preload_rank}")
+            _preload_kernel = _persistent_rocshmem_tdm_wmma_kernel.warmup(
+                tokens,
+                gate_weights,
+                local_expert_up,
+                bias_up,
+                up_v_arg,
+                bias_up_v_arg,
+                local_expert_down,
+                bias_down,
+                out,
+                hidden,
+                ctx.dispatch_tokens,
+                ctx.dispatch_token_ids,
+                ctx.dispatch_probs,
+                ctx.dispatch_counts,
+                ctx.dispatch_signals,
+                ctx.result_values,
+                ctx.result_counts,
+                ctx.result_signals,
+                compute_done,
+                task_queue,
+                task_tail,
+                publish_queue,
+                publish_tail,
+                tile_sync,
+                dispatch_seen,
+                result_seen,
+                task_bound,
+                tasks_done,
+                os_done,
+                dispatch_done,
+                processor_ready,
+                processor_mailboxes,
+                processor_seen,
+                barriers,
+                init_flag,
+                debug_state,
+                launch_epoch,
+                S=s,
+                H=h,
+                I=i,
+                E=e,
+                WORLD=ctx.world_size,
+                NLX=ctx.local_experts,
+                EC=ctx.expert_capacity,
+                R_EC=storage_capacity,
+                TOP_K=top_k,
+                BLOCK_E=block_e,
+                BLOCK_H=resolved_block_h,
+                BLOCK_M=block_m,
+                BLOCK_N=64,
+                ACTIVATION=activation,
+                GATED=gated,
+                NUM_PROGRAMS=num_programs,
+                NUM_WARPS=num_warps,
+                RESULT_ELEM_BYTES=result_elem_bytes,
+                DEBUG=progress_heartbeat,
+                num_warps=num_warps,
+                extern_libs=rocshmem.extern_libs("gfx1250"),
+                grid=(num_programs,),
+            )
+            if _preload_kernel is not None:
+                _ = _preload_kernel.run
+                if not getattr(_preload_kernel, "_flashmoe_rocshmem_module_initialized", False):
+                    _trace(f"module-init-start owner={_preload_rank}")
+                    ctx.runtime.hipmodule_init(int(_preload_kernel.module))
+                    setattr(_preload_kernel, "_flashmoe_rocshmem_module_initialized", True)
+                    _trace(f"module-init-done owner={_preload_rank}")
+            _trace(f"warmup-done owner={_preload_rank}")
+        _trace(f"barrier-start owner={_preload_rank}")
+        ctx.runtime.barrier_all()
+        _trace(f"barrier-done owner={_preload_rank}")
+
+    _trace("launch-start")
+    _persistent_rocshmem_tdm_wmma_kernel[(num_programs,)](
+        tokens,
+        gate_weights,
+        local_expert_up,
+        bias_up,
+        up_v_arg,
+        bias_up_v_arg,
+        local_expert_down,
+        bias_down,
+        out,
+        hidden,
+        ctx.dispatch_tokens,
+        ctx.dispatch_token_ids,
+        ctx.dispatch_probs,
+        ctx.dispatch_counts,
+        ctx.dispatch_signals,
+        ctx.result_values,
+        ctx.result_counts,
+        ctx.result_signals,
+        compute_done,
+        task_queue,
+        task_tail,
+        publish_queue,
+        publish_tail,
+        tile_sync,
+        dispatch_seen,
+        result_seen,
+        task_bound,
+        tasks_done,
+        os_done,
+        dispatch_done,
+        processor_ready,
+        processor_mailboxes,
+        processor_seen,
+        barriers,
+        init_flag,
+        debug_state,
+        launch_epoch,
+        S=s,
+        H=h,
+        I=i,
+        E=e,
+        WORLD=ctx.world_size,
+        NLX=ctx.local_experts,
+        EC=ctx.expert_capacity,
+        R_EC=storage_capacity,
+        TOP_K=top_k,
+        BLOCK_E=block_e,
+        BLOCK_H=resolved_block_h,
+        BLOCK_M=block_m,
+        BLOCK_N=64,
+        ACTIVATION=activation,
+        GATED=gated,
+        NUM_PROGRAMS=num_programs,
+        NUM_WARPS=num_warps,
+        RESULT_ELEM_BYTES=result_elem_bytes,
+        DEBUG=progress_heartbeat,
+        num_warps=num_warps,
+        extern_libs=rocshmem.extern_libs("gfx1250"),
+    )
+    _trace("launch-done")
+    return out
+
+
 def forward_megakernel_rocshmem(
     tokens: torch.Tensor,
     gate_weights: torch.Tensor,
@@ -3991,6 +4385,13 @@ def forward_megakernel_rocshmem(
     num_warps: int = 4,
     num_programs: int = 4,
 ) -> torch.Tensor:
+    if os.environ.get("FLASHMOE_GLUON_ROCSHMEM_EXPERIMENTAL_NONPARITY", "0") != "1":
+        raise RuntimeError(
+            "flashmoe_gluon.forward_megakernel_rocshmem is disabled because its "
+            "distributed protocol is not paper/CUDA parity. Use the HIP flashmoe "
+            "rocSHMEM backend for distributed parity, or set "
+            "FLASHMOE_GLUON_ROCSHMEM_EXPERIMENTAL_NONPARITY=1 for local debugging only."
+        )
     if tokens.ndim != 2 or gate_weights.ndim != 2:
         raise ValueError("tokens must be [S,H] and gate_weights must be [H,E]")
     if local_expert_up.ndim != 3 or local_expert_down.ndim != 3:
@@ -4038,186 +4439,22 @@ def forward_megakernel_rocshmem(
     elif bias_up_v is not None:
         raise ValueError("bias_up_v requires local_expert_up_v")
 
-    resolved_block_h = _next_power_of_2(h) if block_h is None else block_h
-    if resolved_block_h < h:
-        raise ValueError("block_h must cover the full hidden dimension")
-    if h % 64 != 0 or i % 64 != 0:
-        raise ValueError("rocSHMEM Gluon megakernel requires H and I to be divisible by 64 for TDM/WMMA")
-    if num_warps != 4:
-        raise ValueError("rocSHMEM Gluon megakernel requires num_warps=4 for warp-specialized TDM/WMMA")
-    up_v_arg = local_expert_up_v if local_expert_up_v is not None else local_expert_up
-    bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
-
-    rocshmem.register_kernel(_persistent_rocshmem_tdm_wmma_kernel)
-    rocshmem.install_module_init(ctx.runtime)
-
-    out = torch.empty((s, h), device=tokens.device, dtype=torch.float32)
-    hidden = torch.empty((ctx.world_size * ctx.local_experts, ctx.expert_capacity, i), device=tokens.device, dtype=tokens.dtype)
-    compute_done = torch.empty((ctx.world_size * ctx.world_size, ctx.local_experts), device=tokens.device, dtype=torch.int32)
-    block_m = 16
-    route_blocks = _ceil_div(ctx.expert_capacity, block_m)
-    total_channels = ctx.world_size * ctx.local_experts
-    gemm0_tasks = total_channels * route_blocks * (i // 64)
-    gemm1_tasks = total_channels * route_blocks * (h // 64)
-    combine_tasks = total_channels * route_blocks * (h // 64)
-    total_tasks = gemm0_tasks + gemm1_tasks + combine_tasks
-    task_queue = torch.empty((total_tasks,), device=tokens.device, dtype=torch.int32)
-    task_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-    publish_queue = torch.empty((total_channels,), device=tokens.device, dtype=torch.int32)
-    publish_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-    tile_sync = torch.empty((total_channels * route_blocks,), device=tokens.device, dtype=torch.int32)
-    dispatch_seen = torch.empty((total_channels,), device=tokens.device, dtype=torch.int32)
-    result_seen = torch.empty((total_channels,), device=tokens.device, dtype=torch.int32)
-    task_bound = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-    tasks_done = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-    os_done = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-    dispatch_done = torch.empty((1,), device=tokens.device, dtype=torch.int32)
-    processor_ready = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
-    processor_mailboxes = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
-    processor_seen = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
-    barriers = torch.empty((3,), device=tokens.device, dtype=torch.int32)
-    init_flag = torch.zeros((1,), device=tokens.device, dtype=torch.int32)
-    debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
-    progress_heartbeat = debug_trace_enabled
-    result_elem_bytes = torch.empty((), dtype=ctx.result_values.dtype).element_size()
-    debug_state = (
-        torch.zeros((64,), dtype=torch.int32, pin_memory=True)
-        if progress_heartbeat
-        else torch.zeros((1,), device=tokens.device, dtype=torch.int32)
-    )
-    setattr(forward_megakernel_rocshmem, "last_debug_state", debug_state if debug_trace_enabled else None)
-    launch_epoch = ctx.next_epoch()
-    block_e = max(16, _next_power_of_2(e))
-
-    for _preload_rank in range(ctx.world_size):
-        if ctx.rank == _preload_rank:
-            _preload_kernel = _persistent_rocshmem_tdm_wmma_kernel.warmup(
-                tokens,
-                gate_weights,
-                local_expert_up,
-                bias_up,
-                up_v_arg,
-                bias_up_v_arg,
-                local_expert_down,
-                bias_down,
-                out,
-                hidden,
-                ctx.dispatch_tokens,
-                ctx.dispatch_token_ids,
-                ctx.dispatch_probs,
-                ctx.dispatch_counts,
-                ctx.dispatch_signals,
-                ctx.result_values,
-                ctx.result_counts,
-                ctx.result_signals,
-                compute_done,
-                task_queue,
-                task_tail,
-                publish_queue,
-                publish_tail,
-                tile_sync,
-                dispatch_seen,
-                result_seen,
-                task_bound,
-                tasks_done,
-                os_done,
-                dispatch_done,
-                processor_ready,
-                processor_mailboxes,
-                processor_seen,
-                barriers,
-                init_flag,
-                debug_state,
-                launch_epoch,
-                S=s,
-                H=h,
-                I=i,
-                E=e,
-                WORLD=ctx.world_size,
-                NLX=ctx.local_experts,
-                EC=ctx.expert_capacity,
-                TOP_K=top_k,
-                BLOCK_E=block_e,
-                BLOCK_H=resolved_block_h,
-                BLOCK_M=block_m,
-                BLOCK_N=64,
-                ACTIVATION=activation,
-                GATED=gated,
-                NUM_PROGRAMS=num_programs,
-                NUM_WARPS=num_warps,
-                RESULT_ELEM_BYTES=result_elem_bytes,
-                DEBUG=progress_heartbeat,
-                num_warps=num_warps,
-                extern_libs=rocshmem.extern_libs("gfx1250"),
-                grid=(num_programs,),
-            )
-            if _preload_kernel is not None:
-                _ = _preload_kernel.run
-                if not getattr(_preload_kernel, "_flashmoe_rocshmem_module_initialized", False):
-                    ctx.runtime.hipmodule_init(int(_preload_kernel.module))
-                    setattr(_preload_kernel, "_flashmoe_rocshmem_module_initialized", True)
-        ctx.runtime.barrier_all()
-
-    _persistent_rocshmem_tdm_wmma_kernel[(num_programs,)](
+    return _launch_rocshmem_megakernel(
         tokens,
         gate_weights,
         local_expert_up,
-        bias_up,
-        up_v_arg,
-        bias_up_v_arg,
         local_expert_down,
+        bias_up,
         bias_down,
-        out,
-        hidden,
-        ctx.dispatch_tokens,
-        ctx.dispatch_token_ids,
-        ctx.dispatch_probs,
-        ctx.dispatch_counts,
-        ctx.dispatch_signals,
-        ctx.result_values,
-        ctx.result_counts,
-        ctx.result_signals,
-        compute_done,
-        task_queue,
-        task_tail,
-        publish_queue,
-        publish_tail,
-        tile_sync,
-        dispatch_seen,
-        result_seen,
-        task_bound,
-        tasks_done,
-        os_done,
-        dispatch_done,
-        processor_ready,
-        processor_mailboxes,
-        processor_seen,
-        barriers,
-        init_flag,
-        debug_state,
-        launch_epoch,
-        S=s,
-        H=h,
-        I=i,
-        E=e,
-        WORLD=ctx.world_size,
-        NLX=ctx.local_experts,
-        EC=ctx.expert_capacity,
-        TOP_K=top_k,
-        BLOCK_E=block_e,
-        BLOCK_H=resolved_block_h,
-        BLOCK_M=block_m,
-        BLOCK_N=64,
-        ACTIVATION=activation,
-        GATED=gated,
-        NUM_PROGRAMS=num_programs,
-        NUM_WARPS=num_warps,
-        RESULT_ELEM_BYTES=result_elem_bytes,
-        DEBUG=progress_heartbeat,
+        ctx=ctx,
+        top_k=top_k,
+        activation=activation,
+        local_expert_up_v=local_expert_up_v,
+        bias_up_v=bias_up_v,
+        block_h=block_h,
         num_warps=num_warps,
-        extern_libs=rocshmem.extern_libs("gfx1250"),
+        num_programs=num_programs,
     )
-    return out
 
 
 __all__ = [

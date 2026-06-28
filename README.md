@@ -9,7 +9,7 @@ and work seamlessly with CUDA graphs. See paper [here](https://arxiv.org/abs/250
 2. [Our Solution](#our-solution-complete-kernel-fusion)
 3. [Installation](#installation)
 4. [QuickStart](#-python-quickstart)
-5. [Performance Results](#-performance-results)
+5. [Paper Results](#-paper-results)
 6. [Running Benchmarks](#run-benchmark-c)
 
 ## Problem: MoE Bottlenecks in Inference
@@ -18,7 +18,7 @@ and work seamlessly with CUDA graphs. See paper [here](https://arxiv.org/abs/250
   <tr>
     <td align="center">
       <img src="https://raw.githubusercontent.com/osayamenja/FlashMoE/main/assets/FlashMoE_motivation.png" alt="Opportunity" width="800"/><br>
-      <em>Figure 1: Opportunity. MoE takes 67%-95% of inference runtime.</em>
+      <em>Figure 1: Opportunity.</em>
     </td>
     <td align="center">
       <img src="https://raw.githubusercontent.com/osayamenja/FlashMoE/main/assets/FlashMoE_tensor_core_idle_time.png" alt="Tensor core utilization" width="600"/><br>
@@ -27,12 +27,11 @@ and work seamlessly with CUDA graphs. See paper [here](https://arxiv.org/abs/250
   </tr>
 </table>
 
-Distributed Mixture-of-Experts (DMoE) is an extremely demanding workload, both compute- and communication-intensive,
-accounting for up to **95% of total inference runtime** (Figure 1). 
+Distributed Mixture-of-Experts (DMoE) is an extremely demanding workload, both compute- and communication-intensive.
 
 This makes DMoE the primary bottleneck in distributed inference and a critical target for optimization.
 
-However, existing implementations leave significant performance untapped, achieving only **26% tensor core utilization** (Figure 2).
+However, existing implementations leave significant performance untapped.
 
 We identify three key sources of inefficiency:
 
@@ -40,7 +39,7 @@ We identify three key sources of inefficiency:
 2. **Straggler-induced delays** from load imbalance  
 3. **System overheads** from dynamic token routing (e.g., metadata management, inputs preprocessing for compute operators like GroupedGEMM)
 
-As a result, GPUs spend the majority of time stalled, with only **26% of runtime utilizing tensor cores**.
+As a result, GPUs spend much of the MoE runtime stalled rather than executing useful expert work.
 
 ## Our Solution: Complete Kernel Fusion
 
@@ -84,8 +83,7 @@ It leverages:
 ### 🏎️ Portability
 
 We support 
-- SM70 and above GPUs. Boosting compute performance for Hopper and Blackwell is on the roadmap.
-- NVLink and multi-node RDMA (EFA, IBGDA, libfabric as NVSHMEM [supports](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/abstract.html#hardware-requirements)).
+- CUDA GPUs and interconnects supported by the upstream FlashMoE dependencies.
 - FP16, BF16, FP32 (TF32) and FP64. FP8 and even lower precision types are on the roadmap (we welcome contributions!)
 
 ## Requirements
@@ -95,8 +93,8 @@ We support
 - CMake (>= 3.28)
 
 ### Hardware Requirements
-- GPU architecture of at least SM 70. 
-- A P2P GPU interconnect (NVLink, some PCIe and GPUDirect RDMA). NVSHMEM will fail if this criterion is not met.
+See the upstream dependency documentation for CUDA platform and interconnect
+requirements.
 
 ## Installation
 ### cuBLASDx
@@ -125,12 +123,12 @@ See `quickstart.py` for a complete example, the below is just a showcase.
 import flashmoe
 
 if __name__ == "__main__":
-    # Llama4-Scout-17B-16E shapes
+    # model shape
     # model description which flashmoe.initialize uses to JIT compile the kernel
-    tokens_per_rank = 1024
-    token_dim = 5120
-    ffn_size = 8192
-    num_experts = 16
+    tokens_per_rank = ...
+    token_dim = ...
+    ffn_size = ...
+    num_experts = ...
     k = 1
     mlp_type = flashmoe.MLPType.GATED # Gated MLP
     data_type = flashmoe.DataType.BF16
@@ -221,7 +219,7 @@ and include the header file like below. See `csrc/tests/flashmoe.cu` for more us
 ---
 
 ### ✅ Roadmap
-- [ ] Improve MMA for Hopper (WGMMA) and Blackwell (UTCMMA).
+- [ ] Improve MMA support.
 - [ ] FP8
 - [ ] Shared experts
 - [ ] AMD support
@@ -229,48 +227,11 @@ and include the header file like below. See `csrc/tests/flashmoe.cu` for more us
 
 ---
 
-## 📊 Performance Results
-- We measure with the EP+DP parallelism scheme.
-- We compare against: 
-  - [COMET](https://github.com/bytedance/flux) (MLSys '25) at commit: 19831ca2d820e3e782ed1d15d8b52d0898b78b26
-  - [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) at v0.15.3
-  - [Triton-Distributed](https://github.com/ByteDance-Seed/Triton-distributed) at commit: 3644f0586d14591c8a43a10aa6b47fe98a95aea7 
-- We measure a single layer's execution only. 
-- For every model we evaluated, 
-we use model shapes and data types as defined in its corresponding `config.json` on HuggingFace. 
-- We **do not** execute any shared experts.
-> 👉 On frontier MoE models, FlashMoE gives up to 5x speedup and 69% increase in tensor core utilization compared to SOTA baselines.
+## 📊 Paper Results
 
-## Gated MLP
-
-<div align="center">
-  <img src="https://raw.githubusercontent.com/osayamenja/FlashMoE/main/assets/FlashMoE_A100_single_node-2.png" width="4101" alt="">
-<p><em>Figure 4: Up to 5.1x faster MoE layer runtime on Qwen-30B with single-node EP</em></p>
-</div>
-
----
-
-## Conventional MLP
-<div align="center">
-  <img src="https://raw.githubusercontent.com/osayamenja/FlashMoE/main/assets/FlashMoE_A100_vs_COMET.png" width="2946" alt="">
-<p><em>Figure 5: Up to 2.6x faster runtime DeepSeek-V2-Lite</em></p>
-</div>
-
----
-
-## Multi-node (libfabric on Slingshot 11)
-<div align="center">
-  <img src="https://raw.githubusercontent.com/osayamenja/FlashMoE/main/assets/FlashMoE_A100_multi_node.png" width="5592" alt="">
-<p><em>Figure 6: Up to 3x speedup on Llama4-Scout for multi-node EP!</em></p>
-</div>
-
---- 
-
-## H100s
-<div align="center">
-  <img src="https://raw.githubusercontent.com/osayamenja/FlashMoE/main/assets/FlashMoE_H100_single_node.png" width="2940" alt="">
-<p><em>Figure 7: Up to 2.5x speedup on H100s.</em></p>
-</div>
+See the linked paper for public performance figures and methodology. Keep local
+benchmark output, profiler traces, and machine-specific measurements out of
+committed documentation.
 
 ---
 

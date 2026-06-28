@@ -162,6 +162,7 @@ class RocshmemMegakernelContext:
     rank: int
     local_experts: int
     expert_capacity: int
+    storage_capacity: int
     hidden_size: int
     dtype: torch.dtype
     dispatch_tokens: DevicePointer
@@ -188,7 +189,8 @@ class RocshmemMegakernelContext:
     ) -> "RocshmemMegakernelContext":
         elem_size = torch.empty((), dtype=dtype).element_size()
         channels = world_size * world_size * local_experts
-        routes = channels * expert_capacity
+        storage_capacity = ((expert_capacity + 15) // 16) * 16
+        routes = channels * storage_capacity
         matrix_elems = routes * hidden_size
         return cls(
             runtime=runtime,
@@ -196,6 +198,7 @@ class RocshmemMegakernelContext:
             rank=rank,
             local_experts=local_experts,
             expert_capacity=expert_capacity,
+            storage_capacity=storage_capacity,
             hidden_size=hidden_size,
             dtype=dtype,
             dispatch_tokens=runtime.malloc(matrix_elems * elem_size, dtype),

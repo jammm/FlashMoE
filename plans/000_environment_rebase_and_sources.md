@@ -1,59 +1,56 @@
 # Environment, Rebase, and Source Notes
 
-Date: 2026-06-21
-
 ## Repository State
 
-- Working tree: `/jam/flashmoe`
+- Primary working tree: `/jam/FlashMoE`
 - Active branch: `jam/hip_port`
-- Added upstream remote: `https://github.com/osayamenja/FlashMoE`
-- Rebased `jam/hip_port` onto `upstream/main` successfully.
-- Current upstream base after rebase: `9cc0c32 Update citation`
-- Local branch is ahead of the fork remote because rebase rewrote the HIP-port commits. Do not push unless explicitly requested.
+- Do not push unless explicitly requested.
+- `/jam/FlashMoE_clean` is a detached clean worktree for reference comparison.
 
-## ROCm / TheRock Environment
+## Python Environment
 
-Use the TheRock wheels installed in `/jam/venv`.
+Use `/jam/venv` for Python work. For normal PyTorch, Gluon, vLLM, and smoke
+runs, do not force ROCm paths with `LD_LIBRARY_PATH`, `ROCM_HOME`, or
+`ROCM_PATH`; unset them and rely on the venv wheel preload behavior.
+
+Use this pattern for repo-local Python commands:
 
 ```bash
-source /jam/venv/bin/activate
-export ROCM_ROOT="$(rocm-sdk path --root)"
-export PATH="$(rocm-sdk path --bin):$PATH"
-export CMAKE_PREFIX_PATH="$(rocm-sdk path --cmake):$CMAKE_PREFIX_PATH"
-export LD_LIBRARY_PATH="$ROCM_ROOT/lib:$LD_LIBRARY_PATH"
+env -u LD_LIBRARY_PATH -u ROCM_HOME -u ROCM_PATH \
+  PATH="/jam/venv/bin:$PATH" PYTHONPATH=/jam/FlashMoE \
+  /jam/venv/bin/python <script>
 ```
 
-Resolve ROCm paths through `rocm-sdk path` rather than committing machine-specific
-toolchain paths or version output.
+Build-only tasks may need explicit toolchain discovery. Keep those details in
+local scratch notes unless they are source-level requirements.
 
-The local TheRock guidance in `/jam/TheRock/CLAUDE.md` describes TheRock as a CMake super-project, but for this task the important practical point is that ROCm comes from the installed wheel layout rather than `/opt/rocm`.
+## Build Selectors
 
-## GPU State
+Use `gfx1250` for HIP target selection in this branch:
 
-The implementation target is `gfx1250`. Runtime device queries and benchmark
-logs should stay out of git; use local scratch files for run output when needed.
+- `GPU_TARGETS=gfx1250`
+- `CMAKE_HIP_ARCHITECTURES=gfx1250`
+- `ARCH=1250`
+- `FLASHMOE_HIP_ARCH=1250`
+- `PYTORCH_ROCM_ARCH=gfx1250` for Python extension paths that consult it
 
-## Validation Notes
+The HIP JIT passes `GPU_TARGETS` and `ARCH` through CMake. Keep exact generated
+build directories and command output in local scratch space.
 
-Direct HIP:
+## Current Direction
 
-- Build direct HIP tests with host-side references before depending on Python
-  framework results.
+- HIP remains the distributed paper/CUDA parity baseline.
+- Gluon is the local megakernel performance path.
+- Gluon rocSHMEM is guarded because its distributed protocol is not parity yet.
+- vLLM integration work is paused until a supported branch/runtime path is
+  available; keep isolated Gluon and HIP validation moving independently.
 
-PyTorch:
+## Source References
 
-- Do not use PyTorch matmul as the correctness oracle until the local stack is
-  independently validated.
-- Prefer HIP tests with host-computed references for now.
+- FlashMoE paper and public project material.
+- Upstream FlashMoE repository.
+- Local HIP backend implementation under `csrc/include/flashmoe/hip/`.
+- Local Gluon implementation under `flashmoe_gluon/`.
 
-Compile maintenance:
-
-- Keep tests synchronized with template signatures and gfx1250 WMMA tile shapes.
-
-## External Sources Studied
-
-- Paper PDF: https://arxiv.org/pdf/2506.04667
-- Project page: https://flash-moe.github.io/
-- Upstream repository: https://github.com/osayamenja/FlashMoE
-- Public TheRock HIP/TDM headers and tests in the local ROCm checkout
-- Public Triton/LLVM gfx1250 lowering code in `/jam/triton`
+Do not commit device-query output, profiler output, benchmark logs, or raw
+runtime measurements.
