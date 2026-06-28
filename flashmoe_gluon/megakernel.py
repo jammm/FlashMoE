@@ -1022,7 +1022,7 @@ def _init_dynamic_task_queue(
 ):
     pid = gl.program_id(0)
     if pid == 0:
-        slot = pid * 0
+        slot = pid * 0 + GEMM0_TASKS
         while slot < TOTAL_TASKS:
             gl.store(task_queue + slot, -1)
             slot += 1
