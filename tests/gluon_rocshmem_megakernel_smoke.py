@@ -26,6 +26,12 @@ H = 64
 I = 64
 LOCAL_EXPERTS = 1
 EXPERT_CAPACITY = 2
+_ACTIVATIONS = {
+    "identity": fmg.ACT_IDENTITY,
+    "silu": fmg.ACT_SILU,
+    "gelu": fmg.ACT_GELU,
+    "relu": fmg.ACT_RELU,
+}
 
 
 def _allow_ptrace_attach() -> None:
@@ -46,6 +52,10 @@ def _reference(
     bias_up: torch.Tensor,
     bias_down: torch.Tensor,
     top_k: int,
+    *,
+    activation: str,
+    up_v: torch.Tensor | None = None,
+    bias_up_v: torch.Tensor | None = None,
 ) -> torch.Tensor:
     logits = tokens.float() @ gate.float()
     vals, idxs = torch.topk(logits, top_k, dim=1)
@@ -55,6 +65,19 @@ def _reference(
         for route_id in range(top_k):
             expert_id = int(idxs[token_id, route_id])
             hidden = bias_up[expert_id].float() + tokens[token_id].float() @ up[expert_id].float()
+            if activation == "silu":
+                hidden = torch.nn.functional.silu(hidden)
+            elif activation == "gelu":
+                hidden = torch.nn.functional.gelu(hidden, approximate="tanh")
+            elif activation == "relu":
+                hidden = torch.relu(hidden)
+            elif activation != "identity":
+                raise AssertionError(activation)
+            if up_v is not None:
+                if bias_up_v is None:
+                    raise AssertionError("bias_up_v is required for gated reference")
+                hidden_v = bias_up_v[expert_id].float() + tokens[token_id].float() @ up_v[expert_id].float()
+                hidden = hidden * hidden_v
             result = bias_down[expert_id].float() + hidden @ down[expert_id].float()
             out[token_id] += probs[token_id, route_id].float() * result
     return out
@@ -71,6 +94,10 @@ def _worker() -> None:
     atol = float(os.environ.get("FLASHMOE_ATOL", "8e-3"))
     dump_after = float(os.environ.get("FLASHMOE_DUMP_AFTER", "0"))
     defer_reference = os.environ.get("FLASHMOE_DEFER_REFERENCE", "0") == "1"
+    activation = os.environ.get("FLASHMOE_ACTIVATION", "identity")
+    gated = os.environ.get("FLASHMOE_GATED", "0") == "1"
+    if activation not in _ACTIVATIONS:
+        raise ValueError(f"unknown activation: {activation}")
     if dump_after > 0:
         faulthandler.dump_traceback_later(dump_after, repeat=True)
 
@@ -130,12 +157,33 @@ def _worker() -> None:
         down = torch.randn((WORLD * LOCAL_EXPERTS, I, H), device="cuda", dtype=torch.float16)
         bias_up = torch.randn((WORLD * LOCAL_EXPERTS, I), device="cuda", dtype=torch.float16)
         bias_down = torch.randn((WORLD * LOCAL_EXPERTS, H), device="cuda", dtype=torch.float16)
+        up_v = torch.randn((WORLD * LOCAL_EXPERTS, H, I), device="cuda", dtype=torch.float16) if gated else None
+        bias_up_v = torch.randn((WORLD * LOCAL_EXPERTS, I), device="cuda", dtype=torch.float16) if gated else None
 
         local_slice = slice(rank * LOCAL_EXPERTS, (rank + 1) * LOCAL_EXPERTS)
-        expected = None if defer_reference else _reference(tokens, gate, up, down, bias_up, bias_down, top_k).cpu()
+        expected = (
+            None
+            if defer_reference
+            else _reference(
+                tokens,
+                gate,
+                up,
+                down,
+                bias_up,
+                bias_down,
+                top_k,
+                activation=activation,
+                up_v=up_v,
+                bias_up_v=bias_up_v,
+            ).cpu()
+        )
         ok = True
         for repeat_id in range(repeats):
-            log("launch", route_mode, f"top_k={top_k}", f"repeat={repeat_id}")
+            log("launch", route_mode, f"top_k={top_k}", activation, f"gated={gated}", f"repeat={repeat_id}")
+            gated_kwargs = {}
+            if gated:
+                gated_kwargs["local_expert_up_v"] = up_v[local_slice].contiguous()
+                gated_kwargs["bias_up_v"] = bias_up_v[local_slice].contiguous()
             out = fmg.forward_megakernel_rocshmem(
                 tokens,
                 gate,
@@ -145,11 +193,12 @@ def _worker() -> None:
                 bias_down[local_slice].contiguous(),
                 ctx=ctx,
                 top_k=top_k,
-                activation=fmg.ACT_IDENTITY,
+                activation=_ACTIVATIONS[activation],
                 num_programs=num_programs,
                 num_warps=4,
+                **gated_kwargs,
             )
-            log("launched", route_mode, f"top_k={top_k}", f"repeat={repeat_id}")
+            log("launched", route_mode, f"top_k={top_k}", activation, f"gated={gated}", f"repeat={repeat_id}")
             debug_state = getattr(fmg.forward_megakernel_rocshmem, "last_debug_state", None)
             poll_s = float(os.environ.get("FLASHMOE_DEBUG_POLL_S", "0"))
             if debug_state is not None and poll_s > 0:
@@ -162,12 +211,23 @@ def _worker() -> None:
                         last_debug = current_debug
                     time.sleep(0.05)
             torch.cuda.synchronize()
-            log("synced", route_mode, f"top_k={top_k}", f"repeat={repeat_id}")
+            log("synced", route_mode, f"top_k={top_k}", activation, f"gated={gated}", f"repeat={repeat_id}")
             if debug_state is not None:
                 log("debug", debug_state.cpu().tolist())
             got = out.cpu()
             if expected is None:
-                expected = _reference(tokens, gate, up, down, bias_up, bias_down, top_k).cpu()
+                expected = _reference(
+                    tokens,
+                    gate,
+                    up,
+                    down,
+                    bias_up,
+                    bias_down,
+                    top_k,
+                    activation=activation,
+                    up_v=up_v,
+                    bias_up_v=bias_up_v,
+                ).cpu()
             max_abs = float((got - expected).abs().max())
             close = bool(torch.allclose(got, expected, rtol=rtol, atol=atol))
             finite = bool(torch.isfinite(got).all())
@@ -176,6 +236,8 @@ def _worker() -> None:
                 "compare",
                 route_mode,
                 f"top_k={top_k}",
+                activation,
+                f"gated={gated}",
                 f"repeat={repeat_id}",
                 "max_abs",
                 max_abs,
@@ -193,7 +255,7 @@ def _worker() -> None:
         raise
 
 
-def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int) -> None:
+def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int, activation: str, gated: bool) -> None:
     uid = create_uniqueid().hex()
     procs: list[subprocess.Popen[str]] = []
     for rank in range(WORLD):
@@ -203,6 +265,8 @@ def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int) -> No
         env["FLASHMOE_ROUTE_MODE"] = route_mode
         env["FLASHMOE_TOP_K"] = str(top_k)
         env["FLASHMOE_REPEATS"] = str(repeats)
+        env["FLASHMOE_ACTIVATION"] = activation
+        env["FLASHMOE_GATED"] = "1" if gated else "0"
         procs.append(
             subprocess.Popen(
                 [sys.executable, "-u", __file__, "--worker"],
@@ -234,7 +298,7 @@ def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int) -> No
 
     alive = [proc.pid for proc in procs if proc.poll() is None]
     if alive:
-        print("timeout", route_mode, f"top_k={top_k}", "alive", alive, flush=True)
+        print("timeout", route_mode, f"top_k={top_k}", activation, f"gated={gated}", "alive", alive, flush=True)
         for proc in procs:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal_module.SIGTERM)
@@ -249,7 +313,7 @@ def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int) -> No
             os.killpg(proc.pid, signal_module.SIGKILL)
             proc.wait(timeout=2)
     exits = [(proc.pid, proc.returncode) for proc in procs]
-    print("case", route_mode, f"top_k={top_k}", "exits", exits, flush=True)
+    print("case", route_mode, f"top_k={top_k}", activation, f"gated={gated}", "exits", exits, flush=True)
     if alive or any(proc.returncode for proc in procs):
         raise SystemExit(1)
 
@@ -259,6 +323,8 @@ def main() -> None:
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--case", choices=("all", "local", "remote", "remote01", "remote10", "mixed"), default="all")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--activation", choices=tuple(_ACTIVATIONS), default="identity")
+    parser.add_argument("--gated", action="store_true")
     parser.add_argument("--worker", action="store_true")
     args = parser.parse_args()
 
@@ -278,7 +344,7 @@ def main() -> None:
     if args.case in ("all", "mixed"):
         cases.append(("mixed", 2))
     for route_mode, top_k in cases:
-        _run_case(route_mode, top_k, args.timeout_s, args.repeats)
+        _run_case(route_mode, top_k, args.timeout_s, args.repeats, args.activation, args.gated)
 
 
 if __name__ == "__main__":

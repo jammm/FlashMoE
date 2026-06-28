@@ -281,8 +281,13 @@ are:
 - `tests/gluon_rocshmem_megakernel_smoke.py --case mixed`
 - `tests/gluon_rocshmem_megakernel_smoke.py --case remote01`
 - `tests/gluon_rocshmem_megakernel_smoke.py --case remote10`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case remote --repeats 2`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case remote --activation silu --gated`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case mixed --activation silu --gated`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case remote --activation silu --gated --repeats 2`
 
 The rocSHMEM smoke tests use two local PEs on the same GPU and compare each
 rank's output against the CPU reference. The validated smoke shape is
 `S=1`, `H=64`, `I=64`, one local expert per PE, `expert_capacity=2`, and
-`FLASHMOE_NUM_PROGRAMS=4`.
+`FLASHMOE_NUM_PROGRAMS=4`. The gated runs validate the SiLU/value-projection
+path used by the paper-style MoE MLP.
