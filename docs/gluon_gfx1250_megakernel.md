@@ -7,15 +7,14 @@ compute, and warp-specialized processor task bodies.
 
 ## Current Code State
 
-`forward_megakernel(...)` is the public Gluon entry point. For `H` and `I`
+`forward_megakernel(...)` is the main Gluon entry point. For `H` and `I`
 dimensions divisible by 64, it launches one persistent Gluon kernel that:
 
 - initializes scratch state inside the kernel
 - computes routing logits, top-k choices, and normalized route probabilities
 - appends accepted routes into expert-local route storage
 - seeds a device task queue with GEMM0 work
-- runs a persistent OS-style scheduler in program 0
-- runs processor actors in programs 1..N-1
+- runs all resident programs as persistent workers
 - executes GEMM0 and GEMM1 with TDM, LDS staging, mbarriers, and WMMA
 - dynamically enqueues GEMM1 work as soon as each route block finishes GEMM0
 - combines route outputs into the final output tensor inside the same dispatch
@@ -34,12 +33,11 @@ forward_megakernel(...)
     initialize scratch
     route tokens and build expert-local route records
     seed task_queue with GEMM0 tasks
-    program 0: schedule ready processors from task_queue
-    programs 1..N-1: execute processor loop
+    all programs: claim tasks from task_queue
       GEMM0 task: TDM gather/load + WMMA + activation/gate + hidden store
       GEMM0 completion: publish downstream GEMM1 tasks when ready
       GEMM1 task: TDM load + WMMA + output combine
-    send terminal task to each processor
+    terminal task exits all roles
 ```
 
 The host does not launch separate routing, GEMM, activation, combine, or queue
@@ -49,38 +47,42 @@ same kernel launch.
 
 ## Persistent Program Model
 
-The launch uses resident Gluon programs. Program 0 acts as the scheduler during
-the compute portion. Every other program is a processor actor.
+The local launch uses resident Gluon programs as workers. There is no separate
+local scheduler program in the TDM/WMMA path. The epilogue role in each worker
+claims the next task from the global queue with a CAS on `task_head`, then
+broadcasts that task to the compute and producer roles through the worker's
+mailbox.
 
-A processor repeats this loop until it receives the terminal task id:
+A worker repeats this loop until it receives the terminal task id:
 
 ```text
-publish_ready()
-task = wait_for_scheduler_mailbox()
+task = claim_task_queue()
 while task is not terminal:
     execute task
     publish any dependent task records
-    publish_ready()
-    task = wait_for_scheduler_mailbox()
+    task = claim_task_queue()
 ```
 
-The scheduler polls `processor_ready[p]` and assigns task ids through
-`processor_mailboxes[p]`. It exits only after all real task slots have been
-issued and every processor has reported ready again. At that point it sends the
-terminal task id to each processor.
+The mailbox is still used inside each worker because `gl.warp_specialize`
+splits the task body into epilogue, compute, and producer roles. The epilogue
+role owns queue claims and publishes `task + 1` to the per-worker mailbox. The
+other roles wait for a new mailbox value, execute their part of the same task,
+and exit when they observe the terminal task.
 
 ## Dynamic Task Queue
 
 The optimized TDM/WMMA path uses a single queue for both GEMM stages:
 
 - `task_queue`: compact int32 task records
+- `task_head`: next task slot to claim
 - `task_tail`: number of published task slots
 - `tile_sync`: per `(expert, route_block)` GEMM0 completion counters
 
 Initialization writes `-1` to all queue slots, writes all initial GEMM0 task
-ids, clears `tile_sync`, then release-publishes `task_tail = gemm0_tasks`. The
-scheduler consumes queue slots in order. If it sees a reserved-but-not-yet
-published slot, it leaves the processor ready and retries later.
+ids, clears `tile_sync`, then release-publishes `task_head = 0` and
+`task_tail = gemm0_tasks`. Workers claim slots by advancing `task_head`. If a
+worker claims a reserved-but-not-yet-published slot, it waits until the producer
+of that slot stores the task id with release ordering.
 
 GEMM0 tasks are encoded as:
 
@@ -100,7 +102,7 @@ route_block = (gemm1_id % (route_blocks * h_tiles)) / h_tiles
 h_tile = gemm1_id % h_tiles
 ```
 
-After a GEMM0 task stores its hidden tile, the processor increments
+After a GEMM0 task stores its hidden tile, the worker increments
 `tile_sync[expert, route_block]`. The last completed `I` tile for that route
 block enqueues all dependent GEMM1 `H` tiles. This removes the old global
 GEMM0/GEMM1 phase split: downstream work becomes visible as soon as its route
@@ -151,7 +153,7 @@ one 64-column tile.
 
 The epilogue partition TDM-stores the hidden tile to `[E, EC, I]` scratch.
 Inactive rows in a partially-filled route block may be written, but GEMM1 masks
-output publication with the expert route count, so they are not observable.
+output writes with the expert route count, so they are not observable.
 
 ## GEMM1 Task
 
@@ -199,19 +201,27 @@ with a rocSHMEM CPU barrier before launch, then launches one persistent Gluon
 kernel per PE. No host-side routing, GEMM, activation, result-fetch, or combine
 kernels are launched around it.
 
-As in the CUDA path, some worker programs perform token dispatch first and then
-join the normal processor loop. The scheduler and subscriber/publisher stay in
-program 0 while processor programs consume whichever compute or combine tasks
-become ready.
+The distributed kernel uses explicit persistent roles inside the same launch:
+
+- program 0 runs the device scheduler and the rocSHMEM subscriber/publisher
+  partition
+- one or more dispatch programs compute routing, fill local dispatch records,
+  and publish remote dispatch channels
+- the remaining programs are compute workers that consume dynamically enqueued
+  GEMM and combine tasks
+
+Dispatch programs do not enter the compute worker loop after publication. This
+keeps workgroup-level rocSHMEM dispatch calls out of the later nested
+warp-specialized TDM/WMMA task bodies while preserving one host-visible kernel
+launch for the whole MoE body.
 
 The rocSHMEM context owns symmetric dispatch and result buffers. Dispatch uses
 per `(owner_pe, source_pe, local_expert)` channels containing count, token id,
-route probability, and packed token rows. Program 0 acts as the communication
-and scheduler CTA: it writes remote dispatch channel payloads, completes the
-outstanding remote writes, publishes the channel epoch with system-release
-ordering, waits for incoming dispatch epochs, seeds the dynamic GEMM queue, and
-later publishes completed result channels. Processor CTAs execute the TDM/WMMA
-GEMM0 and GEMM1 tasks.
+route probability, and packed token rows. Dispatch programs write remote
+dispatch channel payloads, complete the outstanding remote writes, and publish
+the channel epoch. Program 0 waits for incoming dispatch epochs, seeds the
+dynamic GEMM queue, schedules ready compute workers, and publishes completed
+result channels as the workers enqueue them.
 
 The distributed GEMM tasks reinterpret each `(source_pe, local_expert)` channel
 owned by the local PE as a local tiled expert source:
@@ -222,9 +232,16 @@ owned by the local PE as a local tiled expert source:
   down bias, and writes FP32 result tiles into the symmetric result buffer.
 - Empty channel blocks still advance completion counters, but skip the TDM/WMMA
   body.
-- Remote result publication is centralized in program 0 after the compute
-  barrier, so post-`warp_specialize` processor CTAs do not call rocSHMEM
-  workgroup collectives.
+- Remote result transfer is centralized in program 0 through a publish queue,
+  so post-`warp_specialize` compute workers do not call rocSHMEM workgroup
+  collectives.
+
+Remote channels use rocSHMEM signal operations for visibility. Data-bearing
+dispatch channels write the split count/id/probability arrays first, then use a
+rocSHMEM put-with-signal operation for the packed token rows. Empty dispatch and
+result channels publish only the signal word with a rocSHMEM uint64 signal
+operation. This keeps cross-rank visibility on rocSHMEM APIs without manual
+address translation.
 
 Reusable signal words use monotonically increasing launch epochs and `>= epoch`
 waits. The context allocates signal/count words zero-initialized and advances
@@ -245,10 +262,27 @@ The tiled local smoke covers top-1, top-2, vanilla, and gated cases for
 
 For the distributed path, the current static checks are:
 
-- `/jam/venv/bin/python -m py_compile flashmoe_gluon/megakernel.py flashmoe_gluon/rocshmem.py flashmoe_gluon/rocshmem_runtime.py tests/gluon_rocshmem_megakernel_smoke.py tests/gluon_rocshmem_cross_rank_probe.py tests/gluon_rocshmem_packet_probe.py`
 - `git diff --check`
 
-Before the final cleanup in this patch series, the targeted rocSHMEM cases had
-reached CPU-reference correctness for the hot-cache remote path and the split
-remote dispatch direction. The local, bidirectional remote, and mixed cases must
-be rerun after the GPU runtime is healthy again.
+The low-level rocSHMEM checks that passed with two local PEs are:
+
+- `tests/gluon_rocshmem_packet_probe.py --mode signal-wg`
+- `tests/gluon_rocshmem_packet_probe.py --mode signal-wave`
+- `tests/gluon_rocshmem_cross_rank_probe.py --mode result`
+- `tests/gluon_rocshmem_cross_rank_probe.py --mode tdm-dispatch`
+
+The dynamic scheduling and megakernel checks that passed with short timeouts
+are:
+
+- `tests/gluon_dynamic_ws_probe.py --num-programs 2`
+- `tests/gluon_moe_smoke.py --s 1 --h 64 --i 64 --e 2 --top-k 1 --expert-capacity 2 --num-programs 2`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case local`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case remote`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case mixed`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case remote01`
+- `tests/gluon_rocshmem_megakernel_smoke.py --case remote10`
+
+The rocSHMEM smoke tests use two local PEs on the same GPU and compare each
+rank's output against the CPU reference. The validated smoke shape is
+`S=1`, `H=64`, `I=64`, one local expert per PE, `expert_capacity=2`, and
+`FLASHMOE_NUM_PROGRAMS=4`.
