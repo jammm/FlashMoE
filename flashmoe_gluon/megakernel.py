@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from triton.experimental.gluon.language.amd.gfx1250 import tdm
+from triton.experimental.gluon.language.amd.gfx1250 import mbarrier, tdm
 
 
 ACT_IDENTITY = 0
@@ -243,9 +243,384 @@ def _persistent_phase_barrier(
     _global_barrier(barriers, phase, NUM_PROGRAMS)
 
 
+
+@gluon.aggregate
+class _WsPhaseCounter:
+    iteration: gl.tensor
+    num_barriers: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, iteration, num_barriers):
+        self.iteration = iteration
+        self.num_barriers = gl.constexpr(num_barriers)
+
+    @gluon.jit
+    def create(iteration, num_barriers: gl.constexpr):
+        return _WsPhaseCounter(gl.to_tensor(iteration), num_barriers)
+
+    @gluon.jit
+    def phase(self):
+        return (self.iteration // self.num_barriers) & 1
+
+    @gluon.must_use_result
+    @gluon.jit
+    def next(self):
+        return _WsPhaseCounter(self.iteration + 1, self.num_barriers)
+
+
 @gluon.jit
-def _tdm_wait(num_outstanding: gl.constexpr):
-    tdm.async_wait(num_outstanding)
+def _init_ws_mbarriers(
+    load_empty_bars,
+    load_ready_bars,
+    acc_empty_bars,
+    acc_ready_bars,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_ACC_BUFFERS: gl.constexpr,
+    PRODUCER_WARPS: gl.constexpr,
+    COMPUTE_WARPS: gl.constexpr,
+    EPILOGUE_WARPS: gl.constexpr,
+    ACC_EMPTY_TDM: gl.constexpr,
+):
+    for i in gl.static_range(0, NUM_BUFFERS):
+        mbarrier.init(load_empty_bars.index(i), count=COMPUTE_WARPS * 32)
+        mbarrier.init(load_ready_bars.index(i), count=PRODUCER_WARPS)
+    for i in gl.static_range(0, NUM_ACC_BUFFERS):
+        acc_empty_count: gl.constexpr = EPILOGUE_WARPS if ACC_EMPTY_TDM else EPILOGUE_WARPS * 32
+        mbarrier.init(acc_empty_bars.index(i), count=acc_empty_count)
+        mbarrier.init(acc_ready_bars.index(i), count=COMPUTE_WARPS * 32)
+
+
+@gluon.jit
+def _gemm0_ws_producer(
+    tokens,
+    expert_up,
+    expert_up_v,
+    route_tokens,
+    expert_counts,
+    x_buffer,
+    w_buffer,
+    wv_buffer,
+    load_empty_bars,
+    load_ready_bars,
+    expert_idx,
+    base_slot,
+    base_i,
+    S: gl.constexpr,
+    H: gl.constexpr,
+    I: gl.constexpr,
+    EC: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    PRODUCER_WARPS: gl.constexpr,
+    GATED: gl.constexpr,
+    shared_a_layout: gl.constexpr,
+    shared_b_layout: gl.constexpr,
+):
+    route_layout: gl.constexpr = _route_index_layout(BLOCK_M, PRODUCER_WARPS)
+    route_offs = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, route_layout))
+    expert_count = gl.load(expert_counts + expert_idx)
+    active_rows = base_slot + route_offs < gl.minimum(expert_count, expert_count * 0 + EC)
+    safe_route_rows = gl.minimum(base_slot + route_offs, route_offs * 0 + EC - 1)
+    gathered_tokens = gl.load(
+        route_tokens + expert_idx * EC + safe_route_rows,
+        mask=active_rows,
+        other=0,
+    ).to(gl.int32)
+    empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
+    for h_tile in gl.static_range(0, H // BLOCK_N):
+        buffer_idx = h_tile % NUM_BUFFERS
+        empty_bar = load_empty_bars.index(buffer_idx)
+        ready_bar = load_ready_bars.index(buffer_idx)
+        mbarrier.wait(empty_bar, empty_counter.phase())
+        x_desc = tdm.make_tensor_descriptor(
+            base=tokens + h_tile * BLOCK_N,
+            shape=(S, BLOCK_N),
+            strides=(H, 1),
+            block_shape=(BLOCK_M, BLOCK_N),
+            layout=shared_a_layout,
+        )
+        w_desc = tdm.make_tensor_descriptor(
+            base=expert_up + expert_idx * H * I + (h_tile * BLOCK_N) * I + base_i,
+            shape=(BLOCK_N, BLOCK_N),
+            strides=(I, 1),
+            block_shape=(BLOCK_N, BLOCK_N),
+            layout=shared_b_layout,
+        )
+        tdm.async_gather(x_desc, gathered_tokens, x_buffer.index(buffer_idx))
+        tdm.async_load(w_desc, [0, 0], w_buffer.index(buffer_idx), mbarrier=ready_bar)
+        empty_counter = empty_counter.next()
+
+    if GATED:
+        for h_tile_v in gl.static_range(0, H // BLOCK_N):
+            buffer_idx_v = h_tile_v % NUM_BUFFERS
+            empty_bar_v = load_empty_bars.index(buffer_idx_v)
+            ready_bar_v = load_ready_bars.index(buffer_idx_v)
+            mbarrier.wait(empty_bar_v, empty_counter.phase())
+            xv_desc = tdm.make_tensor_descriptor(
+                base=tokens + h_tile_v * BLOCK_N,
+                shape=(S, BLOCK_N),
+                strides=(H, 1),
+                block_shape=(BLOCK_M, BLOCK_N),
+                layout=shared_a_layout,
+            )
+            wv_desc = tdm.make_tensor_descriptor(
+                base=expert_up_v + expert_idx * H * I + (h_tile_v * BLOCK_N) * I + base_i,
+                shape=(BLOCK_N, BLOCK_N),
+                strides=(I, 1),
+                block_shape=(BLOCK_N, BLOCK_N),
+                layout=shared_b_layout,
+            )
+            tdm.async_gather(xv_desc, gathered_tokens, x_buffer.index(buffer_idx_v))
+            tdm.async_load(wv_desc, [0, 0], wv_buffer.index(buffer_idx_v), mbarrier=ready_bar_v)
+            empty_counter = empty_counter.next()
+
+
+@gluon.jit
+def _gemm0_ws_compute(
+    bias_up,
+    bias_up_v,
+    x_buffer,
+    w_buffer,
+    wv_buffer,
+    hidden_buffer,
+    load_empty_bars,
+    load_ready_bars,
+    acc_empty_bars,
+    acc_ready_bars,
+    expert_idx,
+    base_i,
+    H: gl.constexpr,
+    I: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    ACTIVATION: gl.constexpr,
+    GATED: gl.constexpr,
+    wmma_layout: gl.constexpr,
+):
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    ready_counter = _WsPhaseCounter.create(0, NUM_BUFFERS)
+    acc_empty_bar = acc_empty_bars.index(0)
+    acc_ready_bar = acc_ready_bars.index(0)
+    mbarrier.wait(acc_empty_bar, phase=1)
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
+    for h_tile in gl.static_range(0, H // BLOCK_N):
+        buffer_idx = h_tile % NUM_BUFFERS
+        ready_bar = load_ready_bars.index(buffer_idx)
+        empty_bar = load_empty_bars.index(buffer_idx)
+        mbarrier.wait(ready_bar, ready_counter.phase())
+        x_frag = x_buffer.index(buffer_idx).load(layout=dot_a)
+        w_frag = w_buffer.index(buffer_idx).load(layout=dot_b)
+        acc = gl.amd.gfx1250.wmma(x_frag, w_frag, acc)
+        mbarrier.arrive(empty_bar, count=1)
+        ready_counter = ready_counter.next()
+
+    bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
+    offs_i = base_i + gl.arange(0, BLOCK_N, layout=bias_layout)
+    bias = gl.load(bias_up + expert_idx * I + offs_i).to(gl.float32)
+    hidden_acc = _apply_activation(acc + gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout), ACTIVATION)
+
+    if GATED:
+        acc_v = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
+        for h_tile_v in gl.static_range(0, H // BLOCK_N):
+            buffer_idx_v = h_tile_v % NUM_BUFFERS
+            ready_bar_v = load_ready_bars.index(buffer_idx_v)
+            empty_bar_v = load_empty_bars.index(buffer_idx_v)
+            mbarrier.wait(ready_bar_v, ready_counter.phase())
+            xv_frag = x_buffer.index(buffer_idx_v).load(layout=dot_a)
+            wv_frag = wv_buffer.index(buffer_idx_v).load(layout=dot_b)
+            acc_v = gl.amd.gfx1250.wmma(xv_frag, wv_frag, acc_v)
+            mbarrier.arrive(empty_bar_v, count=1)
+            ready_counter = ready_counter.next()
+        bias_v = gl.load(bias_up_v + expert_idx * I + offs_i).to(gl.float32)
+        acc_v += gl.convert_layout(gl.expand_dims(bias_v, 0), wmma_layout)
+        hidden_acc *= acc_v
+
+    hidden_dtype: gl.constexpr = hidden_buffer.dtype
+    hidden_buffer.index(0).store(hidden_acc.to(hidden_dtype))
+    mbarrier.arrive(acc_ready_bar, count=1)
+
+
+@gluon.jit
+def _gemm0_ws_epilogue(
+    hidden,
+    hidden_buffer,
+    acc_empty_bars,
+    acc_ready_bars,
+    expert_idx,
+    base_slot,
+    base_i,
+    EC: gl.constexpr,
+    I: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    shared_hidden_layout: gl.constexpr,
+):
+    acc_ready_bar = acc_ready_bars.index(0)
+    acc_empty_bar = acc_empty_bars.index(0)
+    mbarrier.wait(acc_ready_bar, phase=0)
+    hidden_desc = tdm.make_tensor_descriptor(
+        base=hidden + expert_idx * EC * I,
+        shape=(EC, I),
+        strides=(I, 1),
+        block_shape=(BLOCK_M, BLOCK_N),
+        layout=shared_hidden_layout,
+    )
+    tdm.async_store(hidden_desc, [base_slot, base_i], hidden_buffer.index(0), mbarrier=acc_empty_bar)
+    tdm.async_wait(0)
+
+
+@gluon.jit
+def _gemm1_ws_producer(
+    hidden,
+    expert_down,
+    h_buffer,
+    down_buffer,
+    load_empty_bars,
+    load_ready_bars,
+    expert_idx,
+    base_slot,
+    base_h,
+    EC: gl.constexpr,
+    I: gl.constexpr,
+    H: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    shared_h_layout: gl.constexpr,
+    shared_down_layout: gl.constexpr,
+):
+    empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
+    hidden_desc = tdm.make_tensor_descriptor(
+        base=hidden + expert_idx * EC * I,
+        shape=(EC, I),
+        strides=(I, 1),
+        block_shape=(BLOCK_M, BLOCK_N),
+        layout=shared_h_layout,
+    )
+    down_desc = tdm.make_tensor_descriptor(
+        base=expert_down + expert_idx * I * H,
+        shape=(I, H),
+        strides=(H, 1),
+        block_shape=(BLOCK_N, BLOCK_N),
+        layout=shared_down_layout,
+    )
+    for i_tile in gl.static_range(0, I // BLOCK_N):
+        buffer_idx = i_tile % NUM_BUFFERS
+        empty_bar = load_empty_bars.index(buffer_idx)
+        ready_bar = load_ready_bars.index(buffer_idx)
+        mbarrier.wait(empty_bar, empty_counter.phase())
+        tdm.async_load(hidden_desc, [base_slot, i_tile * BLOCK_N], h_buffer.index(buffer_idx))
+        tdm.async_load(down_desc, [i_tile * BLOCK_N, base_h], down_buffer.index(buffer_idx), mbarrier=ready_bar)
+        empty_counter = empty_counter.next()
+
+
+@gluon.jit
+def _gemm1_ws_compute(
+    h_buffer,
+    down_buffer,
+    acc_buffer,
+    load_empty_bars,
+    load_ready_bars,
+    acc_empty_bars,
+    acc_ready_bars,
+    I: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    wmma_layout: gl.constexpr,
+):
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    ready_counter = _WsPhaseCounter.create(0, NUM_BUFFERS)
+    acc_empty_bar = acc_empty_bars.index(0)
+    acc_ready_bar = acc_ready_bars.index(0)
+    mbarrier.wait(acc_empty_bar, phase=1)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
+    for i_tile in gl.static_range(0, I // BLOCK_N):
+        buffer_idx = i_tile % NUM_BUFFERS
+        ready_bar = load_ready_bars.index(buffer_idx)
+        empty_bar = load_empty_bars.index(buffer_idx)
+        mbarrier.wait(ready_bar, ready_counter.phase())
+        h_frag = h_buffer.index(buffer_idx).load(layout=dot_a)
+        down_frag = down_buffer.index(buffer_idx).load(layout=dot_b)
+        acc = gl.amd.gfx1250.wmma(h_frag, down_frag, acc)
+        mbarrier.arrive(empty_bar, count=1)
+        ready_counter = ready_counter.next()
+    acc_buffer.index(0).store(acc)
+    mbarrier.arrive(acc_ready_bar, count=1)
+
+
+@gluon.jit
+def _gemm1_ws_epilogue(
+    route_tokens,
+    route_probs,
+    expert_counts,
+    bias_down,
+    output,
+    acc_buffer,
+    acc_empty_bars,
+    acc_ready_bars,
+    expert_idx,
+    base_slot,
+    base_h,
+    EC: gl.constexpr,
+    H: gl.constexpr,
+    TOP_K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    EPILOGUE_WARPS: gl.constexpr,
+    wmma_layout: gl.constexpr,
+):
+    acc_ready_bar = acc_ready_bars.index(0)
+    acc_empty_bar = acc_empty_bars.index(0)
+    mbarrier.wait(acc_ready_bar, phase=0)
+    acc = acc_buffer.index(0).load(layout=wmma_layout)
+
+    bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
+    offs_out = base_h + gl.arange(0, BLOCK_N, layout=bias_layout)
+    bias = gl.load(bias_down + expert_idx * H + offs_out).to(gl.float32)
+    acc += gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout)
+
+    row_layout: gl.constexpr = gl.SliceLayout(1, wmma_layout)
+    route_offs = gl.arange(0, BLOCK_M, layout=row_layout)
+    route_rows = base_slot + route_offs
+    expert_count = gl.load(expert_counts + expert_idx)
+    safe_route_rows = gl.minimum(route_rows, route_rows * 0 + EC - 1)
+    active_route_rows = route_rows < gl.minimum(expert_count, expert_count * 0 + EC)
+    token_ids_route = gl.load(
+        route_tokens + expert_idx * EC + safe_route_rows,
+        mask=active_route_rows,
+        other=0,
+    ).to(gl.int32)
+    probs_route = gl.load(
+        route_probs + expert_idx * EC + safe_route_rows,
+        mask=active_route_rows,
+        other=0.0,
+    ).to(gl.float32)
+    active_rows = gl.convert_layout(active_route_rows, row_layout)
+    token_ids = gl.convert_layout(token_ids_route, row_layout)
+    probs = gl.convert_layout(probs_route, row_layout)
+    token_ids_2d = gl.expand_dims(token_ids, 1)
+    cols_2d = gl.expand_dims(offs_out, 0)
+    output_offsets = gl.convert_layout(token_ids_2d * H + cols_2d, wmma_layout)
+    probs_2d = gl.convert_layout(gl.expand_dims(probs, 1), wmma_layout)
+    active_2d = gl.convert_layout(gl.expand_dims(active_rows, 1), wmma_layout)
+    if TOP_K == 1:
+        gl.store(output + output_offsets, acc * probs_2d, mask=active_2d)
+    else:
+        gl.atomic_add(
+            output + output_offsets,
+            acc * probs_2d,
+            sem="relaxed",
+            scope="gpu",
+            mask=active_2d,
+        )
+    mbarrier.arrive(acc_empty_bar, count=1)
+
 
 
 @gluon.jit
@@ -284,6 +659,87 @@ def _scheduler_run(processor_ready, processor_mailboxes, TOTAL_TASKS: gl.constex
                         sem="release",
                         scope="gpu",
                     )
+
+
+
+@gluon.jit
+def _scheduler_run_queue(
+    processor_ready,
+    processor_mailboxes,
+    task_queue,
+    task_tail,
+    TOTAL_TASKS: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    if pid == 0:
+        next_slot = pid * 0
+        stopped = pid * 0
+        while stopped < NUM_PROGRAMS - 1:
+            for program_id in gl.static_range(1, NUM_PROGRAMS):
+                ready = gl.atomic_xchg(
+                    processor_ready + program_id,
+                    0,
+                    sem="acquire",
+                    scope="gpu",
+                )
+                if ready != 0:
+                    tail = gl.atomic_add(task_tail, 0, sem="acquire", scope="gpu")
+                    if next_slot < tail:
+                        task = gl.atomic_add(task_queue + next_slot, 0, sem="acquire", scope="gpu")
+                        if task >= 0:
+                            next_slot += 1
+                            gl.atomic_xchg(
+                                processor_mailboxes + program_id,
+                                task,
+                                sem="release",
+                                scope="gpu",
+                            )
+                        else:
+                            gl.atomic_xchg(processor_ready + program_id, 1, sem="release", scope="gpu")
+                    else:
+                        if next_slot >= TOTAL_TASKS:
+                            gl.atomic_xchg(
+                                processor_mailboxes + program_id,
+                                TOTAL_TASKS,
+                                sem="release",
+                                scope="gpu",
+                            )
+                            stopped += 1
+                        else:
+                            gl.atomic_xchg(processor_ready + program_id, 1, sem="release", scope="gpu")
+
+
+@gluon.jit
+def _init_dynamic_task_queue(
+    task_queue,
+    task_tail,
+    tile_sync,
+    GEMM0_TASKS: gl.constexpr,
+    TOTAL_TASKS: gl.constexpr,
+    SYNC_SLOTS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    if pid == 0:
+        slot = pid * 0
+        while slot < TOTAL_TASKS:
+            gl.store(task_queue + slot, -1)
+            slot += 1
+        init_task = pid * 0
+        while init_task < GEMM0_TASKS:
+            gl.store(task_queue + init_task, init_task)
+            init_task += 1
+        sync_slot = pid * 0
+        while sync_slot < SYNC_SLOTS:
+            gl.store(tile_sync + sync_slot, 0)
+            sync_slot += 1
+        gl.atomic_xchg(task_tail, GEMM0_TASKS, sem="release", scope="gpu")
+
+
+@gluon.jit
+def _enqueue_task(task_queue, task_tail, task):
+    slot = gl.atomic_add(task_tail, 1, sem="relaxed", scope="gpu")
+    gl.atomic_xchg(task_queue + slot, task, sem="release", scope="gpu")
 
 
 @gluon.jit
@@ -492,6 +948,9 @@ def _persistent_tdm_wmma_kernel(
     expert_counts,
     route_tokens,
     route_probs,
+    task_queue,
+    task_tail,
+    tile_sync,
     processor_ready,
     processor_mailboxes,
     barriers,
@@ -607,227 +1066,263 @@ def _persistent_tdm_wmma_kernel(
     _persistent_phase_barrier(barriers, 1, NUM_PROGRAMS)
 
     _scheduler_reset(processor_ready, processor_mailboxes, NUM_PROGRAMS)
-    _persistent_phase_barrier(barriers, 2, NUM_PROGRAMS)
 
-    wmma_layout: gl.constexpr = _wmma_layout(NUM_WARPS)
-    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
-    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    gl.static_assert(NUM_WARPS == 4, "warp-specialized TDM/WMMA path expects four epilogue waves")
+    PRODUCER_WARPS: gl.constexpr = 4
+    COMPUTE_WARPS: gl.constexpr = 4
+    EPILOGUE_WARPS: gl.constexpr = NUM_WARPS
+    NUM_BUFFERS: gl.constexpr = 2
+    NUM_ACC_BUFFERS: gl.constexpr = 1
+
+    wmma_layout: gl.constexpr = _wmma_layout(COMPUTE_WARPS)
     shared_a_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, BLOCK_N)
     shared_b_layout: gl.constexpr = _wmma_shared_b_layout(BLOCK_N, BLOCK_N)
     shared_h_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, BLOCK_N)
     shared_down_layout: gl.constexpr = _wmma_shared_b_layout(BLOCK_N, BLOCK_N)
-    route_layout: gl.constexpr = _route_index_layout(BLOCK_M, NUM_WARPS)
-    route_offs = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, route_layout))
-
+    shared_acc_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0], [])
     route_blocks: gl.constexpr = (EC + BLOCK_M - 1) // BLOCK_M
     h_tiles: gl.constexpr = H // BLOCK_N
     i_tiles: gl.constexpr = I // BLOCK_N
     gemm0_tasks: gl.constexpr = E * route_blocks * i_tiles
+    gemm1_tasks: gl.constexpr = E * route_blocks * h_tiles
+    total_tasks: gl.constexpr = gemm0_tasks + gemm1_tasks
+    sync_slots: gl.constexpr = E * route_blocks
+    _init_dynamic_task_queue(task_queue, task_tail, tile_sync, gemm0_tasks, total_tasks, sync_slots)
+    _persistent_phase_barrier(barriers, 2, NUM_PROGRAMS)
+
     if pid == 0:
-        _scheduler_run(processor_ready, processor_mailboxes, gemm0_tasks, NUM_PROGRAMS)
+        _scheduler_run_queue(processor_ready, processor_mailboxes, task_queue, task_tail, total_tasks, NUM_PROGRAMS)
     else:
         task_id = _processor_next_task(processor_ready, processor_mailboxes)
-        while task_id < gemm0_tasks:
-            expert_idx = task_id // (route_blocks * i_tiles)
-            rem_task = task_id - expert_idx * route_blocks * i_tiles
-            route_block = rem_task // i_tiles
-            i_tile = rem_task - route_block * i_tiles
-            base_slot = route_block * BLOCK_M
-            base_i = i_tile * BLOCK_N
-            expert_count = gl.load(expert_counts + expert_idx)
-            active_rows = base_slot + route_offs < gl.minimum(expert_count, expert_count * 0 + EC)
-            safe_route_rows = gl.minimum(base_slot + route_offs, route_offs * 0 + EC - 1)
-            gathered_tokens = gl.load(
-                route_tokens + expert_idx * EC + safe_route_rows,
-                mask=active_rows,
-                other=0,
-            ).to(gl.int32)
-
-            x_smem = gl.allocate_shared_memory(
-                tokens.dtype.element_ty,
-                shape=[BLOCK_M, BLOCK_N],
-                layout=shared_a_layout,
-            )
-            w_smem = gl.allocate_shared_memory(
-                expert_up.dtype.element_ty,
-                shape=[BLOCK_N, BLOCK_N],
-                layout=shared_b_layout,
-            )
-            acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
-            for h_tile in gl.static_range(0, h_tiles):
-                x_desc = tdm.make_tensor_descriptor(
-                    base=tokens + h_tile * BLOCK_N,
-                    shape=(S, BLOCK_N),
-                    strides=(H, 1),
-                    block_shape=(BLOCK_M, BLOCK_N),
+        while task_id < total_tasks:
+            if task_id < gemm0_tasks:
+                expert_idx = task_id // (route_blocks * i_tiles)
+                rem_task = task_id - expert_idx * route_blocks * i_tiles
+                route_block = rem_task // i_tiles
+                i_tile = rem_task - route_block * i_tiles
+                base_slot = route_block * BLOCK_M
+                base_i = i_tile * BLOCK_N
+                x_buffer = gl.allocate_shared_memory(
+                    tokens.dtype.element_ty,
+                    shape=[NUM_BUFFERS, BLOCK_M, BLOCK_N],
                     layout=shared_a_layout,
                 )
-                w_desc = tdm.make_tensor_descriptor(
-                    base=expert_up + expert_idx * H * I + (h_tile * BLOCK_N) * I + base_i,
-                    shape=(BLOCK_N, BLOCK_N),
-                    strides=(I, 1),
-                    block_shape=(BLOCK_N, BLOCK_N),
+                w_buffer = gl.allocate_shared_memory(
+                    expert_up.dtype.element_ty,
+                    shape=[NUM_BUFFERS, BLOCK_N, BLOCK_N],
                     layout=shared_b_layout,
                 )
-                tdm.async_gather(x_desc, gathered_tokens, x_smem)
-                tdm.async_load(w_desc, [0, 0], w_smem)
-                _tdm_wait(0)
-                x_frag = x_smem.load(layout=dot_a)
-                w_frag = w_smem.load(layout=dot_b)
-                acc = gl.amd.gfx1250.wmma(x_frag, w_frag, acc)
-
-            bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
-            offs_i = base_i + gl.arange(0, BLOCK_N, layout=bias_layout)
-            bias = gl.load(bias_up + expert_idx * I + offs_i).to(gl.float32)
-            bias_2d = gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout)
-            acc += bias_2d
-            hidden_acc = _apply_activation(acc, ACTIVATION)
-
-            if GATED:
-                wv_smem = gl.allocate_shared_memory(
-                    expert_up_v.dtype.element_ty,
-                    shape=[BLOCK_N, BLOCK_N],
-                    layout=shared_b_layout,
-                )
-                acc_v = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
-                for h_tile_v in gl.static_range(0, h_tiles):
-                    x_desc = tdm.make_tensor_descriptor(
-                        base=tokens + h_tile_v * BLOCK_N,
-                        shape=(S, BLOCK_N),
-                        strides=(H, 1),
-                        block_shape=(BLOCK_M, BLOCK_N),
-                        layout=shared_a_layout,
-                    )
-                    wv_desc = tdm.make_tensor_descriptor(
-                        base=expert_up_v + expert_idx * H * I + (h_tile_v * BLOCK_N) * I + base_i,
-                        shape=(BLOCK_N, BLOCK_N),
-                        strides=(I, 1),
-                        block_shape=(BLOCK_N, BLOCK_N),
+                wv_buffer = w_buffer
+                if GATED:
+                    wv_buffer = gl.allocate_shared_memory(
+                        expert_up_v.dtype.element_ty,
+                        shape=[NUM_BUFFERS, BLOCK_N, BLOCK_N],
                         layout=shared_b_layout,
                     )
-                    tdm.async_gather(x_desc, gathered_tokens, x_smem)
-                    tdm.async_load(wv_desc, [0, 0], wv_smem)
-                    _tdm_wait(0)
-                    x_frag = x_smem.load(layout=dot_a)
-                    wv_frag = wv_smem.load(layout=dot_b)
-                    acc_v = gl.amd.gfx1250.wmma(x_frag, wv_frag, acc_v)
-                bias_v = gl.load(bias_up_v + expert_idx * I + offs_i).to(gl.float32)
-                bias_v_2d = gl.convert_layout(gl.expand_dims(bias_v, 0), wmma_layout)
-                acc_v += bias_v_2d
-                hidden_acc *= acc_v
-
-            rows = base_slot + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, wmma_layout))
-            safe_rows = gl.minimum(rows, rows * 0 + EC - 1)
-            cols = base_i + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, wmma_layout))
-            rows_2d = gl.expand_dims(safe_rows, 1)
-            raw_rows_2d = gl.expand_dims(rows, 1)
-            cols_2d = gl.expand_dims(cols, 0)
-            hidden_offsets = gl.convert_layout((expert_idx * EC + rows_2d) * I + cols_2d, wmma_layout)
-            store_mask = gl.convert_layout(
-                raw_rows_2d < gl.minimum(expert_count, expert_count * 0 + EC),
-                wmma_layout,
-            )
-            gl.store(
-                hidden + hidden_offsets,
-                hidden_acc,
-                mask=store_mask,
-            )
-            task_id = _processor_next_task(processor_ready, processor_mailboxes)
-
-    _persistent_phase_barrier(barriers, 3, NUM_PROGRAMS)
-    _scheduler_reset(processor_ready, processor_mailboxes, NUM_PROGRAMS)
-    _persistent_phase_barrier(barriers, 4, NUM_PROGRAMS)
-
-    gemm1_tasks: gl.constexpr = E * route_blocks * h_tiles
-    if pid == 0:
-        _scheduler_run(processor_ready, processor_mailboxes, gemm1_tasks, NUM_PROGRAMS)
-    else:
-        task_id = _processor_next_task(processor_ready, processor_mailboxes)
-        while task_id < gemm1_tasks:
-            expert_idx = task_id // (route_blocks * h_tiles)
-            rem_task = task_id - expert_idx * route_blocks * h_tiles
-            route_block = rem_task // h_tiles
-            h_tile = rem_task - route_block * h_tiles
-            base_slot = route_block * BLOCK_M
-            base_h = h_tile * BLOCK_N
-            expert_count = gl.load(expert_counts + expert_idx)
-
-            h_smem = gl.allocate_shared_memory(
-                hidden.dtype.element_ty,
-                shape=[BLOCK_M, BLOCK_N],
-                layout=shared_h_layout,
-            )
-            down_smem = gl.allocate_shared_memory(
-                expert_down.dtype.element_ty,
-                shape=[BLOCK_N, BLOCK_N],
-                layout=shared_down_layout,
-            )
-            acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
-            for i_tile_down in gl.static_range(0, i_tiles):
-                h_desc = tdm.make_tensor_descriptor(
-                    base=hidden + expert_idx * EC * I + base_slot * I + i_tile_down * BLOCK_N,
-                    shape=(EC, BLOCK_N),
-                    strides=(I, 1),
-                    block_shape=(BLOCK_M, BLOCK_N),
+                hidden_buffer = gl.allocate_shared_memory(
+                    hidden.dtype.element_ty,
+                    shape=[NUM_ACC_BUFFERS, BLOCK_M, BLOCK_N],
                     layout=shared_h_layout,
                 )
-                down_desc = tdm.make_tensor_descriptor(
-                    base=expert_down + expert_idx * I * H + (i_tile_down * BLOCK_N) * H + base_h,
-                    shape=(BLOCK_N, BLOCK_N),
-                    strides=(H, 1),
-                    block_shape=(BLOCK_N, BLOCK_N),
+                load_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                load_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                acc_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
+                acc_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
+                _init_ws_mbarriers(
+                    load_empty_bars,
+                    load_ready_bars,
+                    acc_empty_bars,
+                    acc_ready_bars,
+                    NUM_BUFFERS,
+                    NUM_ACC_BUFFERS,
+                    PRODUCER_WARPS,
+                    COMPUTE_WARPS,
+                    EPILOGUE_WARPS,
+                    True,
+                )
+                gl.warp_specialize([
+                    (
+                        _gemm0_ws_epilogue,
+                        (
+                            hidden,
+                            hidden_buffer,
+                            acc_empty_bars,
+                            acc_ready_bars,
+                            expert_idx,
+                            base_slot,
+                            base_i,
+                            EC,
+                            I,
+                            BLOCK_M,
+                            BLOCK_N,
+                            shared_h_layout,
+                        ),
+                    ),
+                    (
+                        _gemm0_ws_compute,
+                        (
+                            bias_up,
+                            bias_up_v,
+                            x_buffer,
+                            w_buffer,
+                            wv_buffer,
+                            hidden_buffer,
+                            load_empty_bars,
+                            load_ready_bars,
+                            acc_empty_bars,
+                            acc_ready_bars,
+                            expert_idx,
+                            base_i,
+                            H,
+                            I,
+                            BLOCK_M,
+                            BLOCK_N,
+                            NUM_BUFFERS,
+                            ACTIVATION,
+                            GATED,
+                            wmma_layout,
+                        ),
+                    ),
+                    (
+                        _gemm0_ws_producer,
+                        (
+                            tokens,
+                            expert_up,
+                            expert_up_v,
+                            route_tokens,
+                            expert_counts,
+                            x_buffer,
+                            w_buffer,
+                            wv_buffer,
+                            load_empty_bars,
+                            load_ready_bars,
+                            expert_idx,
+                            base_slot,
+                            base_i,
+                            S,
+                            H,
+                            I,
+                            EC,
+                            BLOCK_M,
+                            BLOCK_N,
+                            NUM_BUFFERS,
+                            PRODUCER_WARPS,
+                            GATED,
+                            shared_a_layout,
+                            shared_b_layout,
+                        ),
+                    ),
+                ], [COMPUTE_WARPS, PRODUCER_WARPS])
+                sync_idx = expert_idx * route_blocks + route_block
+                done_tiles = gl.atomic_add(tile_sync + sync_idx, 1, sem="release", scope="gpu") + 1
+                if done_tiles == i_tiles:
+                    for h_enqueue in gl.static_range(0, h_tiles):
+                        downstream_task = gemm0_tasks + expert_idx * route_blocks * h_tiles + route_block * h_tiles + h_enqueue
+                        _enqueue_task(task_queue, task_tail, downstream_task)
+            else:
+                gemm1_id = task_id - gemm0_tasks
+                expert_idx = gemm1_id // (route_blocks * h_tiles)
+                rem_task = gemm1_id - expert_idx * route_blocks * h_tiles
+                route_block = rem_task // h_tiles
+                h_tile = rem_task - route_block * h_tiles
+                base_slot = route_block * BLOCK_M
+                base_h = h_tile * BLOCK_N
+
+                h_buffer = gl.allocate_shared_memory(
+                    hidden.dtype.element_ty,
+                    shape=[NUM_BUFFERS, BLOCK_M, BLOCK_N],
+                    layout=shared_h_layout,
+                )
+                down_buffer = gl.allocate_shared_memory(
+                    expert_down.dtype.element_ty,
+                    shape=[NUM_BUFFERS, BLOCK_N, BLOCK_N],
                     layout=shared_down_layout,
                 )
-                tdm.async_load(h_desc, [0, 0], h_smem)
-                tdm.async_load(down_desc, [0, 0], down_smem)
-                _tdm_wait(0)
-                h_frag = h_smem.load(layout=dot_a)
-                down_frag = down_smem.load(layout=dot_b)
-                acc = gl.amd.gfx1250.wmma(h_frag, down_frag, acc)
-
-            bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
-            offs_out = base_h + gl.arange(0, BLOCK_N, layout=bias_layout)
-            bias = gl.load(bias_down + expert_idx * H + offs_out).to(gl.float32)
-            bias_2d = gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout)
-            acc += bias_2d
-
-            cols = base_h + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, wmma_layout))
-            route_rows = base_slot + route_offs
-            safe_route_rows = gl.minimum(route_rows, route_rows * 0 + EC - 1)
-            active_route_rows = route_rows < gl.minimum(expert_count, expert_count * 0 + EC)
-            token_ids_route = gl.load(
-                route_tokens + expert_idx * EC + safe_route_rows,
-                mask=active_route_rows,
-                other=0,
-            ).to(gl.int32)
-            probs_route = gl.load(
-                route_probs + expert_idx * EC + safe_route_rows,
-                mask=active_route_rows,
-                other=0.0,
-            ).to(gl.float32)
-            row_layout: gl.constexpr = gl.SliceLayout(1, wmma_layout)
-            active_rows = gl.convert_layout(active_route_rows, row_layout)
-            token_ids = gl.convert_layout(token_ids_route, row_layout)
-            probs = gl.convert_layout(probs_route, row_layout)
-            token_ids_2d = gl.expand_dims(token_ids, 1)
-            cols_2d = gl.expand_dims(cols, 0)
-            output_offsets = gl.convert_layout(token_ids_2d * H + cols_2d, wmma_layout)
-            probs_2d = gl.convert_layout(gl.expand_dims(probs, 1), wmma_layout)
-            active_2d = gl.convert_layout(gl.expand_dims(active_rows, 1), wmma_layout)
-            if TOP_K == 1:
-                gl.store(
-                    output + output_offsets,
-                    acc * probs_2d,
-                    mask=active_2d,
+                acc_buffer = gl.allocate_shared_memory(
+                    gl.float32,
+                    shape=[NUM_ACC_BUFFERS, BLOCK_M, BLOCK_N],
+                    layout=shared_acc_layout,
                 )
-            else:
-                gl.atomic_add(
-                    output + output_offsets,
-                    acc * probs_2d,
-                    sem="relaxed",
-                    scope="gpu",
-                    mask=active_2d,
+                load_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                load_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                acc_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
+                acc_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
+                _init_ws_mbarriers(
+                    load_empty_bars,
+                    load_ready_bars,
+                    acc_empty_bars,
+                    acc_ready_bars,
+                    NUM_BUFFERS,
+                    NUM_ACC_BUFFERS,
+                    PRODUCER_WARPS,
+                    COMPUTE_WARPS,
+                    EPILOGUE_WARPS,
+                    False,
                 )
+                gl.warp_specialize([
+                    (
+                        _gemm1_ws_epilogue,
+                        (
+                            route_tokens,
+                            route_probs,
+                            expert_counts,
+                            bias_down,
+                            output,
+                            acc_buffer,
+                            acc_empty_bars,
+                            acc_ready_bars,
+                            expert_idx,
+                            base_slot,
+                            base_h,
+                            EC,
+                            H,
+                            TOP_K,
+                            BLOCK_M,
+                            BLOCK_N,
+                            EPILOGUE_WARPS,
+                            wmma_layout,
+                        ),
+                    ),
+                    (
+                        _gemm1_ws_compute,
+                        (
+                            h_buffer,
+                            down_buffer,
+                            acc_buffer,
+                            load_empty_bars,
+                            load_ready_bars,
+                            acc_empty_bars,
+                            acc_ready_bars,
+                            I,
+                            BLOCK_M,
+                            BLOCK_N,
+                            NUM_BUFFERS,
+                            wmma_layout,
+                        ),
+                    ),
+                    (
+                        _gemm1_ws_producer,
+                        (
+                            hidden,
+                            expert_down,
+                            h_buffer,
+                            down_buffer,
+                            load_empty_bars,
+                            load_ready_bars,
+                            expert_idx,
+                            base_slot,
+                            base_h,
+                            EC,
+                            I,
+                            H,
+                            BLOCK_M,
+                            BLOCK_N,
+                            NUM_BUFFERS,
+                            shared_h_layout,
+                            shared_down_layout,
+                        ),
+                    ),
+                ], [COMPUTE_WARPS, PRODUCER_WARPS])
             task_id = _processor_next_task(processor_ready, processor_mailboxes)
 
     _global_barrier(barriers, 5, NUM_PROGRAMS)
@@ -1053,6 +1548,11 @@ def forward_megakernel(
                 device=tokens.device,
                 dtype=tokens.dtype,
             )
+            route_blocks = _ceil_div(spec.expert_capacity, block_m)
+            total_tasks = spec.e * route_blocks * ((spec.i // 64) + (spec.h // 64))
+            task_queue = torch.empty((total_tasks,), device=tokens.device, dtype=torch.int32)
+            task_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+            tile_sync = torch.empty((spec.e * route_blocks,), device=tokens.device, dtype=torch.int32)
             _persistent_tdm_wmma_kernel[(num_programs,)](
                 tokens,
                 gate_weights,
@@ -1067,6 +1567,9 @@ def forward_megakernel(
                 expert_counts,
                 route_tokens,
                 route_probs,
+                task_queue,
+                task_tail,
+                tile_sync,
                 processor_ready,
                 processor_mailboxes,
                 barriers,
