@@ -5,6 +5,7 @@ import ctypes
 import faulthandler
 import os
 import select
+import signal as signal_module
 import subprocess
 import sys
 import time
@@ -149,9 +150,19 @@ def _worker() -> None:
                 num_warps=4,
             )
             log("launched", route_mode, f"top_k={top_k}", f"repeat={repeat_id}")
+            debug_state = getattr(fmg.forward_megakernel_rocshmem, "last_debug_state", None)
+            poll_s = float(os.environ.get("FLASHMOE_DEBUG_POLL_S", "0"))
+            if debug_state is not None and poll_s > 0:
+                deadline = time.time() + poll_s
+                last_debug = None
+                while time.time() < deadline:
+                    current_debug = debug_state.tolist()
+                    if current_debug != last_debug:
+                        log("debug-poll", current_debug)
+                        last_debug = current_debug
+                    time.sleep(0.05)
             torch.cuda.synchronize()
             log("synced", route_mode, f"top_k={top_k}", f"repeat={repeat_id}")
-            debug_state = getattr(fmg.forward_megakernel_rocshmem, "last_debug_state", None)
             if debug_state is not None:
                 log("debug", debug_state.cpu().tolist())
             got = out.cpu()
@@ -199,6 +210,7 @@ def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int) -> No
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,
                 text=True,
             )
         )
@@ -225,13 +237,17 @@ def _run_case(route_mode: str, top_k: int, timeout_s: float, repeats: int) -> No
         print("timeout", route_mode, f"top_k={top_k}", "alive", alive, flush=True)
         for proc in procs:
             if proc.poll() is None:
-                proc.terminate()
+                os.killpg(proc.pid, signal_module.SIGTERM)
         time.sleep(1)
         for proc in procs:
             if proc.poll() is None:
-                proc.kill()
+                os.killpg(proc.pid, signal_module.SIGKILL)
     for proc in procs:
-        proc.wait(timeout=2)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal_module.SIGKILL)
+            proc.wait(timeout=2)
     exits = [(proc.pid, proc.returncode) for proc in procs]
     print("case", route_mode, f"top_k={top_k}", "exits", exits, flush=True)
     if alive or any(proc.returncode for proc in procs):

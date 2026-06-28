@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import select
+import signal as signal_module
 import subprocess
 import sys
 import time
@@ -81,11 +82,20 @@ def _packet_put_kernel(send, recv, signal, status, MODE: gl.constexpr, N_ELEMS: 
             rocshmem.ROCSHMEM_SIGNAL_SET,
             peer,
         )
-    elif MODE == "put-direct-signal":
-        rocshmem.putmem_wg(recv, send, N_ELEMS * 4, peer)
-        rocshmem.fence()
-        remote_signal = rocshmem.remote_ptr(signal, peer)
-        gl.atomic_xchg(remote_signal, gl.full((), PAYLOAD_VALUE, gl.uint64), sem="release", scope="sys")
+    elif MODE == "signal-wg":
+        rocshmem.signal_op_wg(
+            signal,
+            gl.full((), PAYLOAD_VALUE, gl.uint64),
+            rocshmem.ROCSHMEM_SIGNAL_SET,
+            peer,
+        )
+    elif MODE == "signal-wave":
+        rocshmem.signal_op_wave(
+            signal,
+            gl.full((), PAYLOAD_VALUE, gl.uint64),
+            rocshmem.ROCSHMEM_SIGNAL_SET,
+            peer,
+        )
     gl.store(status + 1, 2)
 
 
@@ -180,7 +190,10 @@ def _worker() -> None:
         log("status", got)
         expected_first = (1 - rank) * 1000
         expected_last = expected_first + N - 1
-        ok = got[1] == 2 and got[2] == PAYLOAD and got[3] == expected_first and got[4] == expected_last
+        if mode.startswith("signal-"):
+            ok = got[1] == 2 and got[2] == PAYLOAD
+        else:
+            ok = got[1] == 2 and got[2] == PAYLOAD and got[3] == expected_first and got[4] == expected_last
         runtime.free(send)
         runtime.free(recv)
         runtime.free(signal)
@@ -209,6 +222,7 @@ def _run_case(mode: str, timeout_s: float) -> None:
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,
                 text=True,
             )
         )
@@ -235,13 +249,17 @@ def _run_case(mode: str, timeout_s: float) -> None:
         print("timeout", mode, "alive", alive, flush=True)
         for proc in procs:
             if proc.poll() is None:
-                proc.terminate()
+                os.killpg(proc.pid, signal_module.SIGTERM)
         time.sleep(1)
         for proc in procs:
             if proc.poll() is None:
-                proc.kill()
+                os.killpg(proc.pid, signal_module.SIGKILL)
     for proc in procs:
-        proc.wait(timeout=2)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal_module.SIGKILL)
+            proc.wait(timeout=2)
     exits = [(proc.pid, proc.returncode) for proc in procs]
     print("case", mode, "exits", exits, flush=True)
     if alive or any(proc.returncode for proc in procs):
@@ -250,7 +268,11 @@ def _run_case(mode: str, timeout_s: float) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("wg", "wg-seq", "wave", "wave-seq", "put-direct-signal"), default="wg")
+    parser.add_argument(
+        "--mode",
+        choices=("wg", "wg-seq", "wave", "wave-seq", "signal-wg", "signal-wave"),
+        default="wg",
+    )
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--worker", action="store_true")
     args = parser.parse_args()

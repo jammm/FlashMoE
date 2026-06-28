@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import select
+import signal as signal_module
 import subprocess
 import sys
 import time
@@ -123,6 +124,90 @@ def _cross_rank_exchange_kernel(
         gl.store(status + 6, second_id.to(gl.int64))
         gl.store(status + 7, first_token)
         gl.store(status + 8, last_token)
+    elif MODE == "tdm-dispatch":
+        send_idx = (peer * WORLD_SIZE + my_pe) * LOCAL_EXPERTS
+        recv_idx = (my_pe * WORLD_SIZE + peer) * LOCAL_EXPERTS
+        token_vals = (my_pe * 1000 + offs).to(dispatch_tokens.dtype.element_ty)
+        gl.store(dispatch_counts + send_idx, count)
+        gl.store(dispatch_token_ids + send_idx * EXPERT_CAPACITY + small_offs, my_pe * 100 + small_offs)
+        gl.store(dispatch_probs + send_idx * EXPERT_CAPACITY + small_offs, (my_pe * 10 + small_offs).to(gl.float32))
+        gl.store(dispatch_tokens + send_idx * EXPERT_CAPACITY * HIDDEN_SIZE + offs, token_vals)
+        rocshmem.putmem_nbi_wg(dispatch_counts + send_idx, dispatch_counts + send_idx, 4, peer)
+        rocshmem.putmem_nbi_wg(
+            dispatch_token_ids + send_idx * EXPERT_CAPACITY,
+            dispatch_token_ids + send_idx * EXPERT_CAPACITY,
+            EXPERT_CAPACITY * 4,
+            peer,
+        )
+        rocshmem.putmem_nbi_wg(
+            dispatch_probs + send_idx * EXPERT_CAPACITY,
+            dispatch_probs + send_idx * EXPERT_CAPACITY,
+            EXPERT_CAPACITY * 4,
+            peer,
+        )
+        rocshmem.quiet()
+        rocshmem.putmem_signal_nbi_wg(
+            dispatch_tokens + send_idx * EXPERT_CAPACITY * HIDDEN_SIZE,
+            dispatch_tokens + send_idx * EXPERT_CAPACITY * HIDDEN_SIZE,
+            EXPERT_CAPACITY * HIDDEN_SIZE * 2,
+            dispatch_signals + send_idx,
+            payload,
+            rocshmem.ROCSHMEM_SIGNAL_SET,
+            peer,
+        )
+
+        seen = gl.full((), 0, gl.int32)
+        iters = gl.full((), 0, gl.int32)
+        signal = gl.full((), 0, gl.uint64)
+        while (seen == 0) & (iters < MAX_POLL_ITERS):
+            signal = rocshmem.signal_fetch_wave(dispatch_signals + recv_idx)
+            if signal >= payload:
+                seen = 1
+            iters += 1
+
+        block_m: gl.constexpr = 16
+        block_n: gl.constexpr = 64
+        shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[block_n, 8]], [block_m, block_n], [1, 0], []
+        )
+        blocked_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0], [])
+        row_layout: gl.constexpr = gl.SliceLayout(1, blocked_layout)
+        col_layout: gl.constexpr = gl.SliceLayout(0, blocked_layout)
+        smem = gl.allocate_shared_memory(dispatch_tokens.dtype.element_ty, (block_m, block_n), shared_layout)
+        desc = tdm.make_tensor_descriptor(
+            base=dispatch_tokens + recv_idx * EXPERT_CAPACITY * HIDDEN_SIZE,
+            shape=(EXPERT_CAPACITY, HIDDEN_SIZE),
+            strides=(HIDDEN_SIZE, 1),
+            block_shape=(block_m, block_n),
+            layout=shared_layout,
+        )
+        tdm.async_load(desc, [0, 0], smem)
+        tdm.async_wait(0)
+        rows = gl.arange(0, block_m, layout=row_layout)
+        cols = gl.arange(0, block_n, layout=col_layout)
+        vals = smem.load(layout=blocked_layout).to(gl.float32).to(gl.int64)
+        first_tdm = gl.max(gl.where((rows[:, None] == 0) & (cols[None, :] == 0), vals, vals * 0))
+        last_tdm = gl.max(
+            gl.where((rows[:, None] == (EXPERT_CAPACITY - 1)) & (cols[None, :] == (HIDDEN_SIZE - 1)), vals, vals * 0)
+        )
+        recv_count = gl.load(dispatch_counts + recv_idx)
+        first_id = gl.load(dispatch_token_ids + recv_idx * EXPERT_CAPACITY)
+        second_id = gl.load(dispatch_token_ids + recv_idx * EXPERT_CAPACITY + 1)
+        first_direct = gl.load(dispatch_tokens + recv_idx * EXPERT_CAPACITY * HIDDEN_SIZE).to(gl.float32).to(gl.int64)
+        last_direct = gl.load(
+            dispatch_tokens + recv_idx * EXPERT_CAPACITY * HIDDEN_SIZE + (EXPERT_CAPACITY * HIDDEN_SIZE - 1)
+        ).to(gl.float32).to(gl.int64)
+        gl.store(status + 0, my_pe.to(gl.int64))
+        gl.store(status + 1, seen.to(gl.int64))
+        gl.store(status + 2, iters.to(gl.int64))
+        gl.store(status + 3, _signal_count(signal, epoch).to(gl.int64))
+        gl.store(status + 4, recv_count.to(gl.int64))
+        gl.store(status + 5, first_id.to(gl.int64))
+        gl.store(status + 6, second_id.to(gl.int64))
+        gl.store(status + 7, first_direct)
+        gl.store(status + 8, last_direct)
+        gl.store(status + 9, first_tdm)
+        gl.store(status + 10, last_tdm)
     elif MODE == "result":
         send_idx = (my_pe * WORLD_SIZE + peer) * LOCAL_EXPERTS
         recv_idx = (peer * WORLD_SIZE + my_pe) * LOCAL_EXPERTS
@@ -307,8 +392,12 @@ def _cross_rank_exchange_kernel(
     elif MODE == "signal":
         send_idx = (my_pe * WORLD_SIZE + peer) * LOCAL_EXPERTS
         recv_idx = (peer * WORLD_SIZE + my_pe) * LOCAL_EXPERTS
-        remote_signal = rocshmem.remote_ptr(result_signals + send_idx, peer)
-        gl.atomic_xchg(remote_signal, payload, sem="release", scope="sys")
+        rocshmem.signal_op_wave(
+            result_signals + send_idx,
+            payload,
+            rocshmem.ROCSHMEM_SIGNAL_SET,
+            peer,
+        )
 
         seen = gl.full((), 0, gl.int32)
         iters = gl.full((), 0, gl.int32)
@@ -428,6 +517,18 @@ def _worker() -> None:
                 and got[7] == peer * 1000
                 and got[8] == peer * 1000 + EC * H - 1
             )
+        elif mode == "tdm-dispatch":
+            ok = (
+                got[1] == 1
+                and got[3] == EC
+                and got[4] == EC
+                and got[5] == peer * 100
+                and got[6] == peer * 100 + 1
+                and got[7] == peer * 1000
+                and got[8] == peer * 1000 + EC * H - 1
+                and got[9] == peer * 1000
+                and got[10] == peer * 1000 + EC * H - 1
+            )
         elif mode == "result":
             ok = got[1] == 1 and got[3] == EC and got[4] == EC and got[5] == peer * 1000 and got[6] == peer * 1000 + EC * H - 1
         elif mode == "tdm-result":
@@ -484,6 +585,7 @@ def _run_case(mode: str, timeout_s: float) -> None:
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,
                 text=True,
             )
         )
@@ -510,13 +612,17 @@ def _run_case(mode: str, timeout_s: float) -> None:
         print("timeout", mode, "alive", alive, flush=True)
         for proc in procs:
             if proc.poll() is None:
-                proc.terminate()
+                os.killpg(proc.pid, signal_module.SIGTERM)
         time.sleep(1)
         for proc in procs:
             if proc.poll() is None:
-                proc.kill()
+                os.killpg(proc.pid, signal_module.SIGKILL)
     for proc in procs:
-        proc.wait(timeout=2)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal_module.SIGKILL)
+            proc.wait(timeout=2)
     exits = [(proc.pid, proc.returncode) for proc in procs]
     print("case", mode, "exits", exits, flush=True)
     if alive or any(proc.returncode for proc in procs):
@@ -527,7 +633,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("dispatch", "result", "signal", "tdm-result", "tdm-queue-result"),
+        choices=("dispatch", "tdm-dispatch", "result", "signal", "tdm-result", "tdm-queue-result"),
         default="dispatch",
     )
     parser.add_argument("--timeout-s", type=float, default=15.0)

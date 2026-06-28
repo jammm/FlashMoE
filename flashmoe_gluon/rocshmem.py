@@ -38,11 +38,14 @@ declare void @rocshmem_getmem_nbi_wg(ptr, ptr, i64, i32)
 declare void @rocshmem_putmem_signal_wg(ptr, ptr, i64, ptr, i64, i32, i32)
 declare void @rocshmem_putmem_signal_wave(ptr, ptr, i64, ptr, i64, i32, i32)
 declare void @rocshmem_putmem_signal_nbi_wg(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @rocshmem_uint64_atomic_set(ptr, i64, i32)
+declare void @rocshmem_uint64_atomic_add(ptr, i64, i32)
 declare void @rocshmem_uint64_wait_until(ptr, i32, i64)
 declare void @rocshmem_fence()
 declare void @rocshmem_quiet()
 declare void @rocshmem_barrier_all_wg()
 declare void @rocshmem_sync_all_wg()
+declare i32 @llvm.amdgcn.workitem.id.x()
 
 define i32 @fmg_rocshmem_putmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
 entry:
@@ -89,6 +92,58 @@ entry:
 define i32 @fmg_rocshmem_putmem_signal_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
 entry:
   call void @rocshmem_putmem_signal_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_signal_op_wg(ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
+entry:
+  %is_set = icmp eq i32 %sig_op, 0
+  br i1 %is_set, label %set, label %maybe_add
+
+set:
+  call void @rocshmem_uint64_atomic_set(ptr %sig_addr, i64 %signal, i32 %pe)
+  br label %done
+
+maybe_add:
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %is_first = icmp eq i32 %tid, 0
+  br i1 %is_first, label %issue, label %done
+
+issue:
+  %is_add = icmp eq i32 %sig_op, 1
+  br i1 %is_add, label %add, label %done
+
+add:
+  call void @rocshmem_uint64_atomic_add(ptr %sig_addr, i64 %signal, i32 %pe)
+  br label %done
+
+done:
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_signal_op_wave(ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
+entry:
+  %is_set = icmp eq i32 %sig_op, 0
+  br i1 %is_set, label %set, label %maybe_add
+
+set:
+  call void @rocshmem_uint64_atomic_set(ptr %sig_addr, i64 %signal, i32 %pe)
+  br label %done
+
+maybe_add:
+  %tid = call i32 @llvm.amdgcn.workitem.id.x()
+  %is_first = icmp eq i32 %tid, 0
+  br i1 %is_first, label %issue, label %done
+
+issue:
+  %is_add = icmp eq i32 %sig_op, 1
+  br i1 %is_add, label %add, label %done
+
+add:
+  call void @rocshmem_uint64_atomic_add(ptr %sig_addr, i64 %signal, i32 %pe)
+  br label %done
+
+done:
   ret i32 0
 }
 
@@ -338,22 +393,6 @@ def n_pes(_semantic=None):
 
 
 @builtin
-def remote_ptr(local_ptr, pe, _semantic=None):
-    ptr = extern_call(
-        _LIB_NAME,
-        "",
-        [
-            gl.cast(local_ptr, _VOID_PTR, _semantic=_semantic),
-            gl.cast(pe, gl.int32, _semantic=_semantic),
-        ],
-        (((_VOID_PTR, gl.int32), ("rocshmem_ptr", _VOID_PTR)),),
-        is_pure=False,
-        _semantic=_semantic,
-    )
-    return gl.cast(ptr, local_ptr.dtype, _semantic=_semantic)
-
-
-@builtin
 def putmem_wg(dest, source, nbytes, pe, _semantic=None):
     return extern_call(
         _WRAPPER_LIB_NAME,
@@ -514,6 +553,40 @@ def putmem_signal_nbi_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _se
 
 
 @builtin
+def signal_op_wg(sig_addr, signal, sig_op, pe, _semantic=None):
+    return extern_call(
+        _WRAPPER_LIB_NAME,
+        "",
+        [
+            gl.cast(sig_addr, _U64_PTR, _semantic=_semantic),
+            gl.cast(signal, gl.uint64, _semantic=_semantic),
+            gl.cast(sig_op, gl.int32, _semantic=_semantic),
+            gl.cast(pe, gl.int32, _semantic=_semantic),
+        ],
+        (((_U64_PTR, gl.uint64, gl.int32, gl.int32), ("fmg_rocshmem_signal_op_wg", gl.int32)),),
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
+def signal_op_wave(sig_addr, signal, sig_op, pe, _semantic=None):
+    return extern_call(
+        _WRAPPER_LIB_NAME,
+        "",
+        [
+            gl.cast(sig_addr, _U64_PTR, _semantic=_semantic),
+            gl.cast(signal, gl.uint64, _semantic=_semantic),
+            gl.cast(sig_op, gl.int32, _semantic=_semantic),
+            gl.cast(pe, gl.int32, _semantic=_semantic),
+        ],
+        (((_U64_PTR, gl.uint64, gl.int32, gl.int32), ("fmg_rocshmem_signal_op_wave", gl.int32)),),
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
 def signal_wait_until(sig_addr, cmp_op, cmp_val, _semantic=None):
     return extern_call(
         _WRAPPER_LIB_NAME,
@@ -608,7 +681,6 @@ __all__ = [
     "set_ctx",
     "my_pe",
     "n_pes",
-    "remote_ptr",
     "putmem_wave",
     "putmem_wg",
     "putmem_nbi_wg",
@@ -617,6 +689,8 @@ __all__ = [
     "putmem_signal_wave",
     "putmem_signal_wg",
     "putmem_signal_nbi_wg",
+    "signal_op_wave",
+    "signal_op_wg",
     "signal_wait_until",
     "signal_fetch_wave",
     "fence",
