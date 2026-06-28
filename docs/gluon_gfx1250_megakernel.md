@@ -143,6 +143,12 @@ The compute partition:
 5. Computes the gated/value projection when enabled.
 6. Stores the hidden tile to an LDS handoff buffer and signals the epilogue.
 
+For gated GEMM0, the value projection uses its own TDM operand buffers and
+load mbarriers. This matches the CUDA path's structure, where the gate and
+value projections are separate mainloop invocations. Keeping separate pipeline
+state avoids reusing a partially-advanced double-buffer phase when `H` has only
+one 64-column tile.
+
 The epilogue partition TDM-stores the hidden tile to `[E, EC, I]` scratch.
 Inactive rows in a partially-filled route block may be written, but GEMM1 masks
 output publication with the expert route count, so they are not observable.
@@ -201,7 +207,8 @@ The following bounded tests have passed on the local gfx1250 setup:
 - `tests/gluon_warp_specialized_probe.py`
 - `tests/gluon_moe_smoke.py`
 - `tests/gluon_tiled_moe_smoke.py`
+- `tests/gluon_tiled_moe_smoke.py --full`
 
-The `--full` tiled matrix hit the configured 15-second command cap during
-compile/run and left no Python process behind. The default tiled smoke covers
-`64x128`, `128x64`, and gated `128x128` cases against the CPU reference.
+The full tiled smoke covers top-1, top-2, vanilla, and gated cases for
+`64x128`, `128x64`, and `128x128` shapes. It completes under the 15-second
+command cap on the local setup.

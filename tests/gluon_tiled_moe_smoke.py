@@ -88,6 +88,7 @@ def _run_case(
         finite,
         "close",
         close,
+        flush=True,
     )
     if not finite or not close:
         raise SystemExit(2)

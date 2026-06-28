@@ -269,6 +269,19 @@ class _WsPhaseCounter:
 
 
 @gluon.jit
+def _init_ws_load_mbarriers(
+    load_empty_bars,
+    load_ready_bars,
+    NUM_BUFFERS: gl.constexpr,
+    PRODUCER_WARPS: gl.constexpr,
+    COMPUTE_WARPS: gl.constexpr,
+):
+    for i in gl.static_range(0, NUM_BUFFERS):
+        mbarrier.init(load_empty_bars.index(i), count=COMPUTE_WARPS * 32)
+        mbarrier.init(load_ready_bars.index(i), count=PRODUCER_WARPS)
+
+
+@gluon.jit
 def _init_ws_mbarriers(
     load_empty_bars,
     load_ready_bars,
@@ -281,9 +294,7 @@ def _init_ws_mbarriers(
     EPILOGUE_WARPS: gl.constexpr,
     ACC_EMPTY_TDM: gl.constexpr,
 ):
-    for i in gl.static_range(0, NUM_BUFFERS):
-        mbarrier.init(load_empty_bars.index(i), count=COMPUTE_WARPS * 32)
-        mbarrier.init(load_ready_bars.index(i), count=PRODUCER_WARPS)
+    _init_ws_load_mbarriers(load_empty_bars, load_ready_bars, NUM_BUFFERS, PRODUCER_WARPS, COMPUTE_WARPS)
     for i in gl.static_range(0, NUM_ACC_BUFFERS):
         acc_empty_count: gl.constexpr = EPILOGUE_WARPS if ACC_EMPTY_TDM else EPILOGUE_WARPS * 32
         mbarrier.init(acc_empty_bars.index(i), count=acc_empty_count)
@@ -299,9 +310,12 @@ def _gemm0_ws_producer(
     expert_counts,
     x_buffer,
     w_buffer,
+    xv_buffer,
     wv_buffer,
     load_empty_bars,
     load_ready_bars,
+    v_load_empty_bars,
+    v_load_ready_bars,
     expert_idx,
     base_slot,
     base_i,
@@ -352,11 +366,12 @@ def _gemm0_ws_producer(
         empty_counter = empty_counter.next()
 
     if GATED:
+        v_empty_counter = _WsPhaseCounter.create(NUM_BUFFERS, NUM_BUFFERS)
         for h_tile_v in gl.static_range(0, H // BLOCK_N):
             buffer_idx_v = h_tile_v % NUM_BUFFERS
-            empty_bar_v = load_empty_bars.index(buffer_idx_v)
-            ready_bar_v = load_ready_bars.index(buffer_idx_v)
-            mbarrier.wait(empty_bar_v, empty_counter.phase())
+            empty_bar_v = v_load_empty_bars.index(buffer_idx_v)
+            ready_bar_v = v_load_ready_bars.index(buffer_idx_v)
+            mbarrier.wait(empty_bar_v, v_empty_counter.phase())
             xv_desc = tdm.make_tensor_descriptor(
                 base=tokens + h_tile_v * BLOCK_N,
                 shape=(S, BLOCK_N),
@@ -371,9 +386,9 @@ def _gemm0_ws_producer(
                 block_shape=(BLOCK_N, BLOCK_N),
                 layout=shared_b_layout,
             )
-            tdm.async_gather(xv_desc, gathered_tokens, x_buffer.index(buffer_idx_v))
+            tdm.async_gather(xv_desc, gathered_tokens, xv_buffer.index(buffer_idx_v))
             tdm.async_load(wv_desc, [0, 0], wv_buffer.index(buffer_idx_v), mbarrier=ready_bar_v)
-            empty_counter = empty_counter.next()
+            v_empty_counter = v_empty_counter.next()
 
 
 @gluon.jit
@@ -382,10 +397,13 @@ def _gemm0_ws_compute(
     bias_up_v,
     x_buffer,
     w_buffer,
+    xv_buffer,
     wv_buffer,
     hidden_buffer,
     load_empty_bars,
     load_ready_bars,
+    v_load_empty_bars,
+    v_load_ready_bars,
     acc_empty_bars,
     acc_ready_bars,
     expert_idx,
@@ -424,17 +442,18 @@ def _gemm0_ws_compute(
     hidden_acc = _apply_activation(acc + gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout), ACTIVATION)
 
     if GATED:
+        v_ready_counter = _WsPhaseCounter.create(0, NUM_BUFFERS)
         acc_v = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
         for h_tile_v in gl.static_range(0, H // BLOCK_N):
             buffer_idx_v = h_tile_v % NUM_BUFFERS
-            ready_bar_v = load_ready_bars.index(buffer_idx_v)
-            empty_bar_v = load_empty_bars.index(buffer_idx_v)
-            mbarrier.wait(ready_bar_v, ready_counter.phase())
-            xv_frag = x_buffer.index(buffer_idx_v).load(layout=dot_a)
+            ready_bar_v = v_load_ready_bars.index(buffer_idx_v)
+            empty_bar_v = v_load_empty_bars.index(buffer_idx_v)
+            mbarrier.wait(ready_bar_v, v_ready_counter.phase())
+            xv_frag = xv_buffer.index(buffer_idx_v).load(layout=dot_a)
             wv_frag = wv_buffer.index(buffer_idx_v).load(layout=dot_b)
             acc_v = gl.amd.gfx1250.wmma(xv_frag, wv_frag, acc_v)
             mbarrier.arrive(empty_bar_v, count=1)
-            ready_counter = ready_counter.next()
+            v_ready_counter = v_ready_counter.next()
         bias_v = gl.load(bias_up_v + expert_idx * I + offs_i).to(gl.float32)
         acc_v += gl.convert_layout(gl.expand_dims(bias_v, 0), wmma_layout)
         hidden_acc *= acc_v
@@ -1112,20 +1131,37 @@ def _persistent_tdm_wmma_kernel(
                     shape=[NUM_BUFFERS, BLOCK_N, BLOCK_N],
                     layout=shared_b_layout,
                 )
+                load_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                load_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                xv_buffer = x_buffer
                 wv_buffer = w_buffer
+                v_load_empty_bars = load_empty_bars
+                v_load_ready_bars = load_ready_bars
                 if GATED:
+                    xv_buffer = gl.allocate_shared_memory(
+                        tokens.dtype.element_ty,
+                        shape=[NUM_BUFFERS, BLOCK_M, BLOCK_N],
+                        layout=shared_a_layout,
+                    )
                     wv_buffer = gl.allocate_shared_memory(
                         expert_up_v.dtype.element_ty,
                         shape=[NUM_BUFFERS, BLOCK_N, BLOCK_N],
                         layout=shared_b_layout,
+                    )
+                    v_load_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                    v_load_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
+                    _init_ws_load_mbarriers(
+                        v_load_empty_bars,
+                        v_load_ready_bars,
+                        NUM_BUFFERS,
+                        PRODUCER_WARPS,
+                        COMPUTE_WARPS,
                     )
                 hidden_buffer = gl.allocate_shared_memory(
                     hidden.dtype.element_ty,
                     shape=[NUM_ACC_BUFFERS, BLOCK_M, BLOCK_N],
                     layout=shared_h_layout,
                 )
-                load_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
-                load_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_BUFFERS, 1], mbarrier.MBarrierLayout())
                 acc_empty_bars = gl.allocate_shared_memory(gl.int64, [NUM_ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
                 acc_ready_bars = gl.allocate_shared_memory(gl.int64, [NUM_ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
                 _init_ws_mbarriers(
@@ -1165,10 +1201,13 @@ def _persistent_tdm_wmma_kernel(
                             bias_up_v,
                             x_buffer,
                             w_buffer,
+                            xv_buffer,
                             wv_buffer,
                             hidden_buffer,
                             load_empty_bars,
                             load_ready_bars,
+                            v_load_empty_bars,
+                            v_load_ready_bars,
                             acc_empty_bars,
                             acc_ready_bars,
                             expert_idx,
@@ -1193,9 +1232,12 @@ def _persistent_tdm_wmma_kernel(
                             expert_counts,
                             x_buffer,
                             w_buffer,
+                            xv_buffer,
                             wv_buffer,
                             load_empty_bars,
                             load_ready_bars,
+                            v_load_empty_bars,
+                            v_load_ready_bars,
                             expert_idx,
                             base_slot,
                             base_i,
