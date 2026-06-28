@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sysconfig
@@ -20,9 +21,107 @@ ROCSHMEM_SIGNAL_SET = 0
 ROCSHMEM_SIGNAL_ADD = 1
 
 _LIB_NAME = "rocshmem"
+_WRAPPER_LIB_NAME = "fmg_rocshmem"
 _VOID_PTR = gl.pointer_type(gl.void)
 _I64_PTR = gl.pointer_type(gl.int64)
 _U64_PTR = gl.pointer_type(gl.uint64)
+
+_WRAPPER_IR = r'''
+target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
+target triple = "amdgcn-amd-amdhsa"
+
+declare void @rocshmem_putmem_wg(ptr, ptr, i64, i32)
+declare void @rocshmem_putmem_wave(ptr, ptr, i64, i32)
+declare void @rocshmem_putmem_nbi_wg(ptr, ptr, i64, i32)
+declare void @rocshmem_getmem_wg(ptr, ptr, i64, i32)
+declare void @rocshmem_getmem_nbi_wg(ptr, ptr, i64, i32)
+declare void @rocshmem_putmem_signal_wg(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @rocshmem_putmem_signal_wave(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @rocshmem_putmem_signal_nbi_wg(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @rocshmem_uint64_wait_until(ptr, i32, i64)
+declare void @rocshmem_fence()
+declare void @rocshmem_quiet()
+declare void @rocshmem_barrier_all_wg()
+declare void @rocshmem_sync_all_wg()
+
+define i32 @fmg_rocshmem_putmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
+entry:
+  call void @rocshmem_putmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_putmem_wave(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
+entry:
+  call void @rocshmem_putmem_wave(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_putmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
+entry:
+  call void @rocshmem_putmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_getmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
+entry:
+  call void @rocshmem_getmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_getmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
+entry:
+  call void @rocshmem_getmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_putmem_signal_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
+entry:
+  call void @rocshmem_putmem_signal_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_putmem_signal_wave(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
+entry:
+  call void @rocshmem_putmem_signal_wave(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_putmem_signal_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
+entry:
+  call void @rocshmem_putmem_signal_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_uint64_wait_until(ptr %sig_addr, i32 %cmp_op, i64 %cmp_val) {
+entry:
+  call void @rocshmem_uint64_wait_until(ptr %sig_addr, i32 %cmp_op, i64 %cmp_val)
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_fence() {
+entry:
+  call void @rocshmem_fence()
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_quiet() {
+entry:
+  call void @rocshmem_quiet()
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_barrier_all_wg() {
+entry:
+  call void @rocshmem_barrier_all_wg()
+  ret i32 0
+}
+
+define i32 @fmg_rocshmem_sync_all_wg() {
+entry:
+  call void @rocshmem_sync_all_wg()
+  ret i32 0
+}
+'''
 
 
 def _rocm_root_from_sdk() -> str | None:
@@ -59,8 +158,48 @@ def find_device_bitcode(arch: str = "gfx1250") -> str:
     raise FileNotFoundError(f"could not find {lib_name}; searched: {searched}")
 
 
+def _find_llvm_as() -> str:
+    roots = [
+        _rocm_root_from_sdk(),
+        str(Path(sysconfig.get_path("purelib")) / "_rocm_sdk_devel"),
+        os.environ.get("ROCM_ROOT"),
+        os.environ.get("ROCM_PATH"),
+        os.environ.get("ROCM_HOME"),
+        "/opt/rocm",
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root:
+            continue
+        root_path = Path(root)
+        candidates.append(root_path / "lib" / "llvm" / "bin" / "llvm-as")
+        candidates.append(root_path / "bin" / "llvm-as")
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"could not find llvm-as; searched: {searched}")
+
+
+def find_abi_wrapper_bitcode(arch: str = "gfx1250") -> str:
+    digest = hashlib.sha256((_WRAPPER_IR + arch).encode()).hexdigest()[:16]
+    cache_root = Path(os.environ.get("FLASHMOE_ROCSHMEM_ABI_CACHE", "/tmp/flashmoe_rocshmem_abi"))
+    build_dir = cache_root / digest
+    bc_path = build_dir / f"fmg_rocshmem_abi_{arch}.bc"
+    if bc_path.exists():
+        return str(bc_path)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    ir_path = build_dir / f"fmg_rocshmem_abi_{arch}.ll"
+    ir_path.write_text(_WRAPPER_IR)
+    subprocess.run([_find_llvm_as(), str(ir_path), "-o", str(bc_path)], check=True)
+    return str(bc_path)
+
+
 def extern_libs(arch: str = "gfx1250") -> dict[str, str]:
-    return {_LIB_NAME: find_device_bitcode(arch)}
+    return {
+        _WRAPPER_LIB_NAME: find_abi_wrapper_bitcode(arch),
+        _LIB_NAME: find_device_bitcode(arch),
+    }
 
 
 def launch_kwargs(arch: str = "gfx1250") -> dict[str, dict[str, str]]:
@@ -104,6 +243,7 @@ def _module_init_hook(**kwargs):
     if runtime is None:
         raise RuntimeError("rocSHMEM module init hook installed without a runtime")
     runtime.hipmodule_init(int(kernel.module))
+    setattr(kernel, "_flashmoe_rocshmem_module_initialized", True)
 
 
 def _dispatch(lib_name: str, lib_path: str, args: list, arg_type_symbol_dict, is_pure: bool, _semantic):
@@ -216,7 +356,7 @@ def remote_ptr(local_ptr, pe, _semantic=None):
 @builtin
 def putmem_wg(dest, source, nbytes, pe, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(dest, _VOID_PTR, _semantic=_semantic),
@@ -224,7 +364,24 @@ def putmem_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_putmem_wg", gl.int32)),),
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("fmg_rocshmem_putmem_wg", gl.int32)),),
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
+def putmem_wave(dest, source, nbytes, pe, _semantic=None):
+    return extern_call(
+        _WRAPPER_LIB_NAME,
+        "",
+        [
+            gl.cast(dest, _VOID_PTR, _semantic=_semantic),
+            gl.cast(source, _VOID_PTR, _semantic=_semantic),
+            gl.cast(nbytes, gl.int64, _semantic=_semantic),
+            gl.cast(pe, gl.int32, _semantic=_semantic),
+        ],
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("fmg_rocshmem_putmem_wave", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -233,7 +390,7 @@ def putmem_wg(dest, source, nbytes, pe, _semantic=None):
 @builtin
 def putmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(dest, _VOID_PTR, _semantic=_semantic),
@@ -241,7 +398,7 @@ def putmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_putmem_nbi_wg", gl.int32)),),
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("fmg_rocshmem_putmem_nbi_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -250,7 +407,7 @@ def putmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
 @builtin
 def getmem_wg(dest, source, nbytes, pe, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(dest, _VOID_PTR, _semantic=_semantic),
@@ -258,7 +415,7 @@ def getmem_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_getmem_wg", gl.int32)),),
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("fmg_rocshmem_getmem_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -267,7 +424,7 @@ def getmem_wg(dest, source, nbytes, pe, _semantic=None):
 @builtin
 def getmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(dest, _VOID_PTR, _semantic=_semantic),
@@ -275,7 +432,7 @@ def getmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
             gl.cast(nbytes, gl.int64, _semantic=_semantic),
             gl.cast(pe, gl.int32, _semantic=_semantic),
         ],
-        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("rocshmem_getmem_nbi_wg", gl.int32)),),
+        (((_VOID_PTR, _VOID_PTR, gl.int64, gl.int32), ("fmg_rocshmem_getmem_nbi_wg", gl.int32)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -284,7 +441,7 @@ def getmem_nbi_wg(dest, source, nbytes, pe, _semantic=None):
 @builtin
 def putmem_signal_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(dest, _VOID_PTR, _semantic=_semantic),
@@ -298,7 +455,32 @@ def putmem_signal_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semant
         (
             (
                 (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32),
-                ("rocshmem_putmem_signal_wg", gl.int32),
+                ("fmg_rocshmem_putmem_signal_wg", gl.int32),
+            ),
+        ),
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
+def putmem_signal_wave(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
+    return extern_call(
+        _WRAPPER_LIB_NAME,
+        "",
+        [
+            gl.cast(dest, _VOID_PTR, _semantic=_semantic),
+            gl.cast(source, _VOID_PTR, _semantic=_semantic),
+            gl.cast(nbytes, gl.int64, _semantic=_semantic),
+            gl.cast(sig_addr, _U64_PTR, _semantic=_semantic),
+            gl.cast(signal, gl.uint64, _semantic=_semantic),
+            gl.cast(sig_op, gl.int32, _semantic=_semantic),
+            gl.cast(pe, gl.int32, _semantic=_semantic),
+        ],
+        (
+            (
+                (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32),
+                ("fmg_rocshmem_putmem_signal_wave", gl.int32),
             ),
         ),
         is_pure=False,
@@ -309,7 +491,7 @@ def putmem_signal_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semant
 @builtin
 def putmem_signal_nbi_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(dest, _VOID_PTR, _semantic=_semantic),
@@ -323,7 +505,7 @@ def putmem_signal_nbi_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _se
         (
             (
                 (_VOID_PTR, _VOID_PTR, gl.int64, _U64_PTR, gl.uint64, gl.int32, gl.int32),
-                ("rocshmem_putmem_signal_nbi_wg", gl.int32),
+                ("fmg_rocshmem_putmem_signal_nbi_wg", gl.int32),
             ),
         ),
         is_pure=False,
@@ -334,14 +516,28 @@ def putmem_signal_nbi_wg(dest, source, nbytes, sig_addr, signal, sig_op, pe, _se
 @builtin
 def signal_wait_until(sig_addr, cmp_op, cmp_val, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(sig_addr, _U64_PTR, _semantic=_semantic),
             gl.cast(cmp_op, gl.int32, _semantic=_semantic),
             gl.cast(cmp_val, gl.uint64, _semantic=_semantic),
         ],
-        (((_U64_PTR, gl.int32, gl.uint64), ("rocshmem_uint64_wait_until", gl.int32)),),
+        (((_U64_PTR, gl.int32, gl.uint64), ("fmg_rocshmem_uint64_wait_until", gl.int32)),),
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
+def signal_fetch_wave(sig_addr, _semantic=None):
+    return extern_call(
+        _LIB_NAME,
+        "",
+        [
+            gl.cast(sig_addr, _U64_PTR, _semantic=_semantic),
+        ],
+        (((_U64_PTR,), ("rocshmem_signal_fetch_wave", gl.uint64)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -350,10 +546,10 @@ def signal_wait_until(sig_addr, cmp_op, cmp_val, _semantic=None):
 @builtin
 def fence(_semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("rocshmem_fence", gl.int32)},
+        {(): ("fmg_rocshmem_fence", gl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )
@@ -362,10 +558,10 @@ def fence(_semantic=None):
 @builtin
 def quiet(_semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("rocshmem_quiet", gl.int32)},
+        {(): ("fmg_rocshmem_quiet", gl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )
@@ -374,10 +570,10 @@ def quiet(_semantic=None):
 @builtin
 def barrier_all(_semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("rocshmem_barrier_all_wg", gl.int32)},
+        {(): ("fmg_rocshmem_barrier_all_wg", gl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )
@@ -386,10 +582,10 @@ def barrier_all(_semantic=None):
 @builtin
 def sync_all(_semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("rocshmem_sync_all_wg", gl.int32)},
+        {(): ("fmg_rocshmem_sync_all_wg", gl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )
@@ -413,13 +609,16 @@ __all__ = [
     "my_pe",
     "n_pes",
     "remote_ptr",
+    "putmem_wave",
     "putmem_wg",
     "putmem_nbi_wg",
     "getmem_wg",
     "getmem_nbi_wg",
+    "putmem_signal_wave",
     "putmem_signal_wg",
     "putmem_signal_nbi_wg",
     "signal_wait_until",
+    "signal_fetch_wave",
     "fence",
     "quiet",
     "barrier_all",

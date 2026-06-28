@@ -20,9 +20,9 @@ dimensions divisible by 64, it launches one persistent Gluon kernel that:
 - dynamically enqueues GEMM1 work as soon as each route block finishes GEMM0
 - combines route outputs into the final output tensor inside the same dispatch
 
-The scalar persistent FFN path remains as a fallback for unsupported boundary
-shapes. `forward_scalar_top1_debug(...)` is kept as a small compiler/runtime
-probe.
+The local single-GPU entry point still keeps the small scalar debug/probe path
+for unsupported boundary shapes. The rocSHMEM entry point requires `H` and `I`
+to be divisible by 64 and uses the TDM/WMMA path directly.
 
 ## Single Dispatch Shape
 
@@ -193,22 +193,62 @@ records feed GEMM0 gathers and GEMM1 output combine.
 
 ## rocSHMEM Path
 
-The rocSHMEM device shim is separate from the local single-GPU Gluon MoE path.
-It links the gfx1250 rocSHMEM device bitcode through Gluon extern libraries and
-exposes PE queries, remote pointer lookup, workgroup put/get, nonblocking
-put/get, put-with-signal, signal wait, fence, and quiet. The eventual
-distributed kernel should publish communication work as queue tasks without
-changing the host-visible single-dispatch shape.
+`forward_megakernel_rocshmem(...)` is the distributed Gluon entry point. It
+uses the same host-visible single GPU dispatch shape: the host coordinates PEs
+with a rocSHMEM CPU barrier before launch, then launches one persistent Gluon
+kernel per PE. No host-side routing, GEMM, activation, result-fetch, or combine
+kernels are launched around it.
+
+As in the CUDA path, some worker programs perform token dispatch first and then
+join the normal processor loop. The scheduler and subscriber/publisher stay in
+program 0 while processor programs consume whichever compute or combine tasks
+become ready.
+
+The rocSHMEM context owns symmetric dispatch and result buffers. Dispatch uses
+per `(owner_pe, source_pe, local_expert)` channels containing count, token id,
+route probability, and packed token rows. Program 0 acts as the communication
+and scheduler CTA: it writes remote dispatch channel payloads, completes the
+outstanding remote writes, publishes the channel epoch with system-release
+ordering, waits for incoming dispatch epochs, seeds the dynamic GEMM queue, and
+later publishes completed result channels. Processor CTAs execute the TDM/WMMA
+GEMM0 and GEMM1 tasks.
+
+The distributed GEMM tasks reinterpret each `(source_pe, local_expert)` channel
+owned by the local PE as a local tiled expert source:
+
+- GEMM0 loads packed dispatch rows from symmetric memory and local up weights
+  with TDM, runs WMMA, applies activation/gating, and stores hidden tiles.
+- GEMM1 loads hidden tiles and local down weights with TDM, runs WMMA, adds
+  down bias, and writes FP32 result tiles into the symmetric result buffer.
+- Empty channel blocks still advance completion counters, but skip the TDM/WMMA
+  body.
+- Remote result publication is centralized in program 0 after the compute
+  barrier, so post-`warp_specialize` processor CTAs do not call rocSHMEM
+  workgroup collectives.
+
+Reusable signal words use monotonically increasing launch epochs and `>= epoch`
+waits. The context allocates signal/count words zero-initialized and advances
+the epoch per forward call, so repeated launches on the same context do not need
+a host-side scratch reset.
 
 ## Validation
 
-The following bounded tests have passed on the local gfx1250 setup:
+The following local checks cover the non-distributed Gluon path:
 
 - `tests/gluon_warp_specialized_probe.py`
 - `tests/gluon_moe_smoke.py`
 - `tests/gluon_tiled_moe_smoke.py`
 - `tests/gluon_tiled_moe_smoke.py --full`
 
-The full tiled smoke covers top-1, top-2, vanilla, and gated cases for
-`64x128`, `128x64`, and `128x128` shapes. It completes under the 15-second
-command cap on the local setup.
+The tiled local smoke covers top-1, top-2, vanilla, and gated cases for
+`64x128`, `128x64`, and `128x128` shapes.
+
+For the distributed path, the current static checks are:
+
+- `/jam/venv/bin/python -m py_compile flashmoe_gluon/megakernel.py flashmoe_gluon/rocshmem.py flashmoe_gluon/rocshmem_runtime.py tests/gluon_rocshmem_megakernel_smoke.py tests/gluon_rocshmem_cross_rank_probe.py tests/gluon_rocshmem_packet_probe.py`
+- `git diff --check`
+
+Before the final cleanup in this patch series, the targeted rocSHMEM cases had
+reached CPU-reference correctness for the hot-cache remote path and the split
+remote dispatch direction. The local, bidirectional remote, and mixed cases must
+be rerun after the GPU runtime is healthy again.

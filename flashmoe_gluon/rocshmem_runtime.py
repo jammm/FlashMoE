@@ -78,10 +78,21 @@ def _find_devel_root() -> Path:
     raise FileNotFoundError(f"could not find rocSHMEM headers/static library; searched: {searched}")
 
 
+def _preload_runtime_sysdeps() -> None:
+    devel = _find_devel_root()
+    sysdeps_lib = devel / "lib" / "rocm_sysdeps" / "lib"
+    for soname in ("libnuma.so", "libnuma.so.1"):
+        path = sysdeps_lib / soname
+        if path.exists():
+            ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+            return
+
+
 def _build_shared() -> Path:
     rocm = Path(_rocm_root())
     devel = _find_devel_root()
-    digest = hashlib.sha256((_CPP_SOURCE + str(rocm) + str(devel)).encode()).hexdigest()[:16]
+    digest_input = _CPP_SOURCE + str(rocm) + str(devel) + "sysdeps-rpath-v1"
+    digest = hashlib.sha256(digest_input.encode()).hexdigest()[:16]
     build_dir = _cache_dir() / digest
     lib_path = build_dir / "libflashmoe_rocshmem_runtime.so"
     if lib_path.exists():
@@ -108,6 +119,9 @@ def _build_shared() -> Path:
         f"-L{rocm / 'lib'}",
         f"-L{core_lib}",
         f"-L{sysdeps_lib}",
+        f"-Wl,-rpath,{sysdeps_lib}",
+        f"-Wl,-rpath,{core_lib}",
+        f"-Wl,-rpath,{rocm / 'lib'}",
         "-lrocshmem",
         "-lamdhip64",
         "-lhsa-runtime64",
@@ -158,6 +172,7 @@ class RocshmemMegakernelContext:
     result_values: DevicePointer
     result_counts: DevicePointer
     result_signals: DevicePointer
+    launch_epoch: int = 0
 
     @classmethod
     def create(
@@ -186,12 +201,18 @@ class RocshmemMegakernelContext:
             dispatch_tokens=runtime.malloc(matrix_elems * elem_size, dtype),
             dispatch_token_ids=runtime.malloc(routes * 4, torch.int32),
             dispatch_probs=runtime.malloc(routes * 4, torch.float32),
-            dispatch_counts=runtime.malloc(channels * 4, torch.int32),
-            dispatch_signals=runtime.malloc(channels * 8, torch.uint64),
+            dispatch_counts=runtime.calloc(channels, 4, torch.int32),
+            dispatch_signals=runtime.calloc(channels, 8, torch.uint64),
             result_values=runtime.malloc(matrix_elems * 4, torch.float32),
-            result_counts=runtime.malloc(channels * 4, torch.int32),
-            result_signals=runtime.malloc(channels * 8, torch.uint64),
+            result_counts=runtime.calloc(channels, 4, torch.int32),
+            result_signals=runtime.calloc(channels, 8, torch.uint64),
         )
+
+    def next_epoch(self) -> int:
+        self.launch_epoch += 1
+        if self.launch_epoch >= (1 << 63):
+            self.launch_epoch = 1
+        return self.launch_epoch
 
     def zero_(self) -> None:
         for ptr in (
@@ -203,6 +224,7 @@ class RocshmemMegakernelContext:
             self.runtime.memset(ptr, 0)
         self.runtime.synchronize()
         self.runtime.barrier_all()
+        self.launch_epoch = 0
 
     def close(self) -> None:
         seen: set[int] = set()
@@ -224,6 +246,7 @@ class RocshmemMegakernelContext:
 class RocshmemRuntime:
     def __init__(self, lib_path: str | Path | None = None):
         self.lib_path = Path(lib_path) if lib_path is not None else _build_shared()
+        _preload_runtime_sysdeps()
         self.lib = ctypes.CDLL(str(self.lib_path), mode=ctypes.RTLD_GLOBAL)
         self._configure_abi()
         self.initialized = False
