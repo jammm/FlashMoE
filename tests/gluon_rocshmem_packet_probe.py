@@ -36,7 +36,40 @@ def _packet_put_kernel(send, recv, signal, status, MODE: gl.constexpr, N_ELEMS: 
     gl.store(send + offs, values)
     gl.store(status + 0, my_pe)
     gl.store(status + 1, 1)
-    if MODE == "wg":
+    if MODE == "fence":
+        rocshmem.fence()
+    elif MODE == "quiet":
+        rocshmem.quiet()
+    elif MODE == "put-wg":
+        rocshmem.putmem_wg(recv, send, N_ELEMS * 4, peer)
+    elif MODE == "put-wave":
+        rocshmem.putmem_wave(recv, send, N_ELEMS * 4, peer)
+    elif MODE == "wg-fence":
+        rocshmem.putmem_wg(recv, send, N_ELEMS * 4, peer)
+        rocshmem.fence()
+    elif MODE == "wave-fence":
+        rocshmem.putmem_wave(recv, send, N_ELEMS * 4, peer)
+        rocshmem.fence()
+    elif MODE == "wave-quiet":
+        rocshmem.putmem_wave(recv, send, N_ELEMS * 4, peer)
+        rocshmem.quiet()
+    elif MODE == "nbi-wg-quiet":
+        rocshmem.putmem_nbi_wg(recv, send, N_ELEMS * 4, peer)
+        rocshmem.quiet()
+    elif MODE == "nbi-wg-signal":
+        rocshmem.putmem_nbi_wg(recv, send, 4, peer)
+        rocshmem.quiet()
+        rocshmem.putmem_signal_nbi_wg(
+            recv,
+            send,
+            N_ELEMS * 4,
+            signal,
+            gl.full((), PAYLOAD_VALUE, gl.uint64),
+            rocshmem.ROCSHMEM_SIGNAL_SET,
+            peer,
+        )
+        rocshmem.quiet()
+    elif MODE == "wg":
         rocshmem.putmem_signal_wg(
             recv,
             send,
@@ -190,10 +223,28 @@ def _worker() -> None:
         log("status", got)
         expected_first = (1 - rank) * 1000
         expected_last = expected_first + N - 1
+        signal_modes = {"wg", "wg-seq", "wave", "wave-seq", "signal-wg", "signal-wave", "nbi-wg-signal"}
+        data_modes = {
+            "wg",
+            "wg-seq",
+            "wave",
+            "wave-seq",
+            "put-wg",
+            "put-wave",
+            "wg-fence",
+            "wave-fence",
+            "wave-quiet",
+            "nbi-wg-quiet",
+            "nbi-wg-signal",
+        }
         if mode.startswith("signal-"):
             ok = got[1] == 2 and got[2] == PAYLOAD
-        else:
+        elif mode in signal_modes:
             ok = got[1] == 2 and got[2] == PAYLOAD and got[3] == expected_first and got[4] == expected_last
+        elif mode in data_modes:
+            ok = got[1] == 2
+        else:
+            ok = got[1] == 2
         runtime.free(send)
         runtime.free(recv)
         runtime.free(signal)
@@ -270,7 +321,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("wg", "wg-seq", "wave", "wave-seq", "signal-wg", "signal-wave"),
+        choices=(
+            "fence",
+            "quiet",
+            "put-wg",
+            "put-wave",
+            "wg-fence",
+            "wave-fence",
+            "wave-quiet",
+            "nbi-wg-quiet",
+            "nbi-wg-signal",
+            "wg",
+            "wg-seq",
+            "wave",
+            "wave-seq",
+            "signal-wg",
+            "signal-wave",
+        ),
         default="wg",
     )
     parser.add_argument("--timeout-s", type=float, default=15.0)

@@ -6,6 +6,7 @@ from .megakernel import (
     ACT_RELU,
     ACT_SILU,
     forward_megakernel,
+    forward_megakernel_from_topk,
     forward_megakernel_rocshmem,
     forward_scalar_top1_debug,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "ACT_GELU",
     "ACT_RELU",
     "forward_megakernel",
+    "forward_megakernel_from_topk",
     "forward_megakernel_rocshmem",
     "forward_scalar_top1_debug",
     "backend_status",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -40,6 +41,16 @@ def _next_power_of_2(x: int) -> int:
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _resolve_tdm_num_programs(dtype: torch.dtype, block_h: int, requested: int) -> int:
+    del dtype, block_h
+    max_programs = int(os.environ.get("FLASHMOE_TDM_MAX_PROGRAMS", "16"))
+    resolved = min(requested, max_programs)
+    # gfx1250 currently has a reproducible phase-barrier stall at four programs.
+    if 2 < resolved < 8:
+        return 2
+    return resolved
 
 
 def _validate_common(
@@ -1003,6 +1014,7 @@ def _init_dynamic_task_queue(
     task_queue,
     task_head,
     task_tail,
+    gemm0_pending,
     tile_sync,
     GEMM0_TASKS: gl.constexpr,
     TOTAL_TASKS: gl.constexpr,
@@ -1025,6 +1037,7 @@ def _init_dynamic_task_queue(
         _wait_storecnt0()
         gl.atomic_xchg(task_head, 0, sem="release", scope="gpu")
         gl.atomic_xchg(task_tail, GEMM0_TASKS, sem="release", scope="gpu")
+        gl.atomic_xchg(gemm0_pending, GEMM0_TASKS, sem="release", scope="gpu")
 
 
 @gluon.jit
@@ -1279,6 +1292,7 @@ def _publish_result_channel_wave(
                 rocshmem.ROCSHMEM_SIGNAL_SET,
                 source_pe,
             )
+            rocshmem.quiet()
         else:
             rocshmem.putmem_wave(
                 result_counts + count_idx,
@@ -1296,6 +1310,7 @@ def _publish_result_channel_wave(
                 rocshmem.ROCSHMEM_SIGNAL_SET,
                 source_pe,
             )
+            rocshmem.quiet()
 
 
 @gluon.jit
@@ -1572,6 +1587,7 @@ def _worker_claim_task_queue(
     task_queue,
     task_head,
     task_tail,
+    gemm0_pending,
     processor_mailboxes,
     debug_state,
     DEBUG: gl.constexpr,
@@ -1596,7 +1612,8 @@ def _worker_claim_task_queue(
                     task = gl.atomic_add(task_queue + head, 0, sem="acquire", scope="gpu")
                 claimed = 1
         else:
-            if head >= TOTAL_TASKS:
+            pending = gl.atomic_add(gemm0_pending, 0, sem="acquire", scope="gpu")
+            if pending == 0:
                 task = pid * 0 + TOTAL_TASKS
                 claimed = 1
             else:
@@ -1685,9 +1702,10 @@ def _persistent_dispatch_moe_kernel(
     h_mask = offs_h < H
 
     if pid == 0:
-        for expert_id in gl.static_range(0, BLOCK_E):
-            if expert_id < E:
-                gl.store(expert_counts + expert_id, 0)
+        expert_id = pid * 0
+        while expert_id < E:
+            gl.store(expert_counts + expert_id, 0)
+            expert_id += 1
         for phase in gl.static_range(0, 4):
             gl.store(barriers + phase, 0)
         if NUM_PROGRAMS > 1:
@@ -1852,6 +1870,7 @@ class _LocalWsArgs:
     task_queue: gl.tensor
     task_head: gl.tensor
     task_tail: gl.tensor
+    gemm0_pending: gl.tensor
     tile_sync: gl.tensor
     processor_mailboxes: gl.tensor
     processor_seen: gl.tensor
@@ -1914,6 +1933,7 @@ def _local_ws_epilogue_loop_p(p):
         p.task_queue,
         p.task_head,
         p.task_tail,
+        p.gemm0_pending,
         p.processor_mailboxes,
         p.debug_state,
         p.DEBUG,
@@ -1931,56 +1951,61 @@ def _local_ws_epilogue_loop_p(p):
             i_tile = rem_task - route_block * p.I_TILES
             base_slot = route_block * p.BLOCK_M
             base_i = i_tile * p.BLOCK_N
+            expert_count = gl.load(p.expert_counts + expert_idx)
+            active_route_block = base_slot < gl.minimum(expert_count, expert_count * 0 + p.EC)
 
-            if p.GATED:
-                _init_ws_load_mbarriers(
-                    p.gemm0_v_load_empty_bars,
-                    p.gemm0_v_load_ready_bars,
+            if active_route_block:
+                if p.GATED:
+                    _init_ws_load_mbarriers(
+                        p.gemm0_v_load_empty_bars,
+                        p.gemm0_v_load_ready_bars,
+                        p.NUM_BUFFERS,
+                        p.PRODUCER_WARPS,
+                        p.COMPUTE_WARPS,
+                        1,
+                    )
+                _init_ws_mbarriers(
+                    p.gemm0_load_empty_bars,
+                    p.gemm0_load_ready_bars,
+                    p.gemm0_acc_empty_bars,
+                    p.gemm0_acc_ready_bars,
                     p.NUM_BUFFERS,
+                    p.NUM_ACC_BUFFERS,
                     p.PRODUCER_WARPS,
                     p.COMPUTE_WARPS,
+                    p.EPILOGUE_WARPS,
+                    True,
                     1,
                 )
-            _init_ws_mbarriers(
-                p.gemm0_load_empty_bars,
-                p.gemm0_load_ready_bars,
-                p.gemm0_acc_empty_bars,
-                p.gemm0_acc_ready_bars,
-                p.NUM_BUFFERS,
-                p.NUM_ACC_BUFFERS,
-                p.PRODUCER_WARPS,
-                p.COMPUTE_WARPS,
-                p.EPILOGUE_WARPS,
-                True,
-                1,
-            )
             _wait_dscnt0()
             mbarrier.arrive(p.task_start_bar.index(0), count=1)
             mbarrier.wait(p.task_start_bar.index(0), task_phase.phase())
             task_phase = task_phase.next()
-
-            _gemm0_ws_epilogue(
-                p.hidden,
-                p.gemm0_hidden_buffer,
-                p.gemm0_acc_empty_bars,
-                p.gemm0_acc_ready_bars,
-                expert_idx,
-                base_slot,
-                base_i,
-                p.EC,
-                p.I,
-                p.BLOCK_M,
-                p.BLOCK_N,
-                p.shared_h_layout,
-            )
-            sync_idx = expert_idx * p.ROUTE_BLOCKS + route_block
-            done_tiles = gl.atomic_add(p.tile_sync + sync_idx, 1, sem="release", scope="gpu") + 1
-            if done_tiles == p.I_TILES:
-                h_enqueue = pid * 0
-                while h_enqueue < p.H_TILES:
-                    downstream_task = p.GEMM0_TASKS + expert_idx * p.ROUTE_BLOCKS * p.H_TILES + route_block * p.H_TILES + h_enqueue
-                    _enqueue_task(p.task_queue, p.task_tail, downstream_task)
-                    h_enqueue += 1
+            if active_route_block:
+                _gemm0_ws_epilogue(
+                    p.hidden,
+                    p.gemm0_hidden_buffer,
+                    p.gemm0_acc_empty_bars,
+                    p.gemm0_acc_ready_bars,
+                    expert_idx,
+                    base_slot,
+                    base_i,
+                    p.EC,
+                    p.I,
+                    p.BLOCK_M,
+                    p.BLOCK_N,
+                    p.shared_h_layout,
+                )
+            if active_route_block:
+                sync_idx = expert_idx * p.ROUTE_BLOCKS + route_block
+                done_tiles = gl.atomic_add(p.tile_sync + sync_idx, 1, sem="release", scope="gpu") + 1
+                if done_tiles == p.I_TILES:
+                    h_enqueue = pid * 0
+                    while h_enqueue < p.H_TILES:
+                        downstream_task = p.GEMM0_TASKS + expert_idx * p.ROUTE_BLOCKS * p.H_TILES + route_block * p.H_TILES + h_enqueue
+                        _enqueue_task(p.task_queue, p.task_tail, downstream_task)
+                        h_enqueue += 1
+            gl.atomic_add(p.gemm0_pending, -1, sem="release", scope="gpu")
         else:
             gemm1_id = task_id - p.GEMM0_TASKS
             expert_idx = gemm1_id // (p.ROUTE_BLOCKS * p.H_TILES)
@@ -1989,50 +2014,54 @@ def _local_ws_epilogue_loop_p(p):
             h_tile = rem_task - route_block * p.H_TILES
             base_slot = route_block * p.BLOCK_M
             base_h = h_tile * p.BLOCK_N
+            expert_count = gl.load(p.expert_counts + expert_idx)
+            active_route_block = base_slot < gl.minimum(expert_count, expert_count * 0 + p.EC)
 
-            _init_ws_mbarriers(
-                p.gemm1_load_empty_bars,
-                p.gemm1_load_ready_bars,
-                p.gemm1_acc_empty_bars,
-                p.gemm1_acc_ready_bars,
-                p.NUM_BUFFERS,
-                p.NUM_ACC_BUFFERS,
-                p.PRODUCER_WARPS,
-                p.COMPUTE_WARPS,
-                p.EPILOGUE_WARPS,
-                False,
-                1,
-            )
+            if active_route_block:
+                _init_ws_mbarriers(
+                    p.gemm1_load_empty_bars,
+                    p.gemm1_load_ready_bars,
+                    p.gemm1_acc_empty_bars,
+                    p.gemm1_acc_ready_bars,
+                    p.NUM_BUFFERS,
+                    p.NUM_ACC_BUFFERS,
+                    p.PRODUCER_WARPS,
+                    p.COMPUTE_WARPS,
+                    p.EPILOGUE_WARPS,
+                    False,
+                    1,
+                )
             _wait_dscnt0()
             mbarrier.arrive(p.task_start_bar.index(0), count=1)
             mbarrier.wait(p.task_start_bar.index(0), task_phase.phase())
             task_phase = task_phase.next()
-
-            _gemm1_ws_epilogue(
-                p.route_tokens,
-                p.route_probs,
-                p.expert_counts,
-                p.bias_down,
-                p.output,
-                p.gemm1_acc_buffer,
-                p.gemm1_acc_empty_bars,
-                p.gemm1_acc_ready_bars,
-                expert_idx,
-                base_slot,
-                base_h,
-                p.EC,
-                p.H,
-                p.TOP_K,
-                p.BLOCK_M,
-                p.BLOCK_N,
-                p.EPILOGUE_WARPS,
-                p.wmma_layout,
-            )
-            _wait_storecnt0()
+            if active_route_block:
+                _gemm1_ws_epilogue(
+                    p.route_tokens,
+                    p.route_probs,
+                    p.expert_counts,
+                    p.bias_down,
+                    p.output,
+                    p.gemm1_acc_buffer,
+                    p.gemm1_acc_empty_bars,
+                    p.gemm1_acc_ready_bars,
+                    expert_idx,
+                    base_slot,
+                    base_h,
+                    p.EC,
+                    p.H,
+                    p.TOP_K,
+                    p.BLOCK_M,
+                    p.BLOCK_N,
+                    p.EPILOGUE_WARPS,
+                    p.wmma_layout,
+                )
+                _wait_storecnt0()
         task_id = _worker_claim_task_queue(
             p.task_queue,
             p.task_head,
             p.task_tail,
+            p.gemm0_pending,
             p.processor_mailboxes,
             p.debug_state,
             p.DEBUG,
@@ -2045,6 +2074,9 @@ def _local_ws_epilogue_loop_p(p):
 
 @gluon.jit
 def _local_ws_compute_loop_p(p):
+    pid = gl.program_id(0)
+    if p.DEBUG:
+        gl.store(p.debug_state + 8 + pid, 500)
     task_phase = _WsPhaseCounter.create(0, 1)
     task_id = _processor_wait_task_queue_role(
         p.processor_mailboxes,
@@ -2056,57 +2088,72 @@ def _local_ws_compute_loop_p(p):
         p.DEBUG_SCHED,
     )
     while task_id < p.TOTAL_TASKS:
+        if p.DEBUG:
+            gl.store(p.debug_state + 40 + pid, task_id)
         if task_id < p.GEMM0_TASKS:
             expert_idx = task_id // (p.ROUTE_BLOCKS * p.I_TILES)
             rem_task = task_id - expert_idx * p.ROUTE_BLOCKS * p.I_TILES
+            route_block = rem_task // p.I_TILES
             i_tile = rem_task - (rem_task // p.I_TILES) * p.I_TILES
+            base_slot = route_block * p.BLOCK_M
             base_i = i_tile * p.BLOCK_N
+            expert_count = gl.load(p.expert_counts + expert_idx)
+            active_route_block = base_slot < gl.minimum(expert_count, expert_count * 0 + p.EC)
             mbarrier.arrive(p.task_start_bar.index(0), count=1)
             mbarrier.wait(p.task_start_bar.index(0), task_phase.phase())
             task_phase = task_phase.next()
-            _gemm0_ws_compute(
-                p.bias_up,
-                p.bias_up_v,
-                p.gemm0_x_buffer,
-                p.gemm0_w_buffer,
-                p.gemm0_xv_buffer,
-                p.gemm0_wv_buffer,
-                p.gemm0_hidden_buffer,
-                p.gemm0_load_empty_bars,
-                p.gemm0_load_ready_bars,
-                p.gemm0_v_load_empty_bars,
-                p.gemm0_v_load_ready_bars,
-                p.gemm0_acc_empty_bars,
-                p.gemm0_acc_ready_bars,
-                expert_idx,
-                base_i,
-                p.H,
-                p.I,
-                p.BLOCK_M,
-                p.BLOCK_N,
-                p.NUM_BUFFERS,
-                p.ACTIVATION,
-                p.GATED,
-                p.wmma_layout,
-            )
+            if active_route_block:
+                _gemm0_ws_compute(
+                    p.bias_up,
+                    p.bias_up_v,
+                    p.gemm0_x_buffer,
+                    p.gemm0_w_buffer,
+                    p.gemm0_xv_buffer,
+                    p.gemm0_wv_buffer,
+                    p.gemm0_hidden_buffer,
+                    p.gemm0_load_empty_bars,
+                    p.gemm0_load_ready_bars,
+                    p.gemm0_v_load_empty_bars,
+                    p.gemm0_v_load_ready_bars,
+                    p.gemm0_acc_empty_bars,
+                    p.gemm0_acc_ready_bars,
+                    expert_idx,
+                    base_i,
+                    p.H,
+                    p.I,
+                    p.BLOCK_M,
+                    p.BLOCK_N,
+                    p.NUM_BUFFERS,
+                    p.ACTIVATION,
+                    p.GATED,
+                    p.wmma_layout,
+                )
         else:
+            gemm1_id = task_id - p.GEMM0_TASKS
+            expert_idx = gemm1_id // (p.ROUTE_BLOCKS * p.H_TILES)
+            rem_task = gemm1_id - expert_idx * p.ROUTE_BLOCKS * p.H_TILES
+            route_block = rem_task // p.H_TILES
+            base_slot = route_block * p.BLOCK_M
+            expert_count = gl.load(p.expert_counts + expert_idx)
+            active_route_block = base_slot < gl.minimum(expert_count, expert_count * 0 + p.EC)
             mbarrier.arrive(p.task_start_bar.index(0), count=1)
             mbarrier.wait(p.task_start_bar.index(0), task_phase.phase())
             task_phase = task_phase.next()
-            _gemm1_ws_compute(
-                p.gemm1_h_buffer,
-                p.gemm1_down_buffer,
-                p.gemm1_acc_buffer,
-                p.gemm1_load_empty_bars,
-                p.gemm1_load_ready_bars,
-                p.gemm1_acc_empty_bars,
-                p.gemm1_acc_ready_bars,
-                p.I,
-                p.BLOCK_M,
-                p.BLOCK_N,
-                p.NUM_BUFFERS,
-                p.wmma_layout,
-            )
+            if active_route_block:
+                _gemm1_ws_compute(
+                    p.gemm1_h_buffer,
+                    p.gemm1_down_buffer,
+                    p.gemm1_acc_buffer,
+                    p.gemm1_load_empty_bars,
+                    p.gemm1_load_ready_bars,
+                    p.gemm1_acc_empty_bars,
+                    p.gemm1_acc_ready_bars,
+                    p.I,
+                    p.BLOCK_M,
+                    p.BLOCK_N,
+                    p.NUM_BUFFERS,
+                    p.wmma_layout,
+                )
         task_id = _processor_wait_task_queue_role(
             p.processor_mailboxes,
             p.processor_seen,
@@ -2116,10 +2163,15 @@ def _local_ws_compute_loop_p(p):
             p.DEBUG,
             p.DEBUG_SCHED,
         )
+    if p.DEBUG:
+        gl.store(p.debug_state + 8 + pid, 800)
 
 
 @gluon.jit
 def _local_ws_producer_loop_p(p):
+    pid = gl.program_id(0)
+    if p.DEBUG:
+        gl.store(p.debug_state + 16 + pid, 600)
     task_phase = _WsPhaseCounter.create(0, 1)
     task_id = _processor_wait_task_queue_role(
         p.processor_mailboxes,
@@ -2131,6 +2183,8 @@ def _local_ws_producer_loop_p(p):
         p.DEBUG_SCHED,
     )
     while task_id < p.TOTAL_TASKS:
+        if p.DEBUG:
+            gl.store(p.debug_state + 56 + pid, task_id)
         if task_id < p.GEMM0_TASKS:
             expert_idx = task_id // (p.ROUTE_BLOCKS * p.I_TILES)
             rem_task = task_id - expert_idx * p.ROUTE_BLOCKS * p.I_TILES
@@ -2138,38 +2192,41 @@ def _local_ws_producer_loop_p(p):
             i_tile = rem_task - route_block * p.I_TILES
             base_slot = route_block * p.BLOCK_M
             base_i = i_tile * p.BLOCK_N
+            expert_count = gl.load(p.expert_counts + expert_idx)
+            active_route_block = base_slot < gl.minimum(expert_count, expert_count * 0 + p.EC)
             mbarrier.arrive(p.task_start_bar.index(0), count=1)
             mbarrier.wait(p.task_start_bar.index(0), task_phase.phase())
             task_phase = task_phase.next()
-            _gemm0_ws_producer(
-                p.tokens,
-                p.expert_up,
-                p.expert_up_v,
-                p.route_tokens,
-                p.expert_counts,
-                p.gemm0_x_buffer,
-                p.gemm0_w_buffer,
-                p.gemm0_xv_buffer,
-                p.gemm0_wv_buffer,
-                p.gemm0_load_empty_bars,
-                p.gemm0_load_ready_bars,
-                p.gemm0_v_load_empty_bars,
-                p.gemm0_v_load_ready_bars,
-                expert_idx,
-                base_slot,
-                base_i,
-                p.S,
-                p.H,
-                p.I,
-                p.EC,
-                p.BLOCK_M,
-                p.BLOCK_N,
-                p.NUM_BUFFERS,
-                p.PRODUCER_WARPS,
-                p.GATED,
-                p.shared_a_layout,
-                p.shared_b_layout,
-            )
+            if active_route_block:
+                _gemm0_ws_producer(
+                    p.tokens,
+                    p.expert_up,
+                    p.expert_up_v,
+                    p.route_tokens,
+                    p.expert_counts,
+                    p.gemm0_x_buffer,
+                    p.gemm0_w_buffer,
+                    p.gemm0_xv_buffer,
+                    p.gemm0_wv_buffer,
+                    p.gemm0_load_empty_bars,
+                    p.gemm0_load_ready_bars,
+                    p.gemm0_v_load_empty_bars,
+                    p.gemm0_v_load_ready_bars,
+                    expert_idx,
+                    base_slot,
+                    base_i,
+                    p.S,
+                    p.H,
+                    p.I,
+                    p.EC,
+                    p.BLOCK_M,
+                    p.BLOCK_N,
+                    p.NUM_BUFFERS,
+                    p.PRODUCER_WARPS,
+                    p.GATED,
+                    p.shared_a_layout,
+                    p.shared_b_layout,
+                )
         else:
             gemm1_id = task_id - p.GEMM0_TASKS
             expert_idx = gemm1_id // (p.ROUTE_BLOCKS * p.H_TILES)
@@ -2178,28 +2235,31 @@ def _local_ws_producer_loop_p(p):
             h_tile = rem_task - route_block * p.H_TILES
             base_slot = route_block * p.BLOCK_M
             base_h = h_tile * p.BLOCK_N
+            expert_count = gl.load(p.expert_counts + expert_idx)
+            active_route_block = base_slot < gl.minimum(expert_count, expert_count * 0 + p.EC)
             mbarrier.arrive(p.task_start_bar.index(0), count=1)
             mbarrier.wait(p.task_start_bar.index(0), task_phase.phase())
             task_phase = task_phase.next()
-            _gemm1_ws_producer(
-                p.hidden,
-                p.expert_down,
-                p.gemm1_h_buffer,
-                p.gemm1_down_buffer,
-                p.gemm1_load_empty_bars,
-                p.gemm1_load_ready_bars,
-                expert_idx,
-                base_slot,
-                base_h,
-                p.EC,
-                p.I,
-                p.H,
-                p.BLOCK_M,
-                p.BLOCK_N,
-                p.NUM_BUFFERS,
-                p.shared_h_layout,
-                p.shared_down_layout,
-            )
+            if active_route_block:
+                _gemm1_ws_producer(
+                    p.hidden,
+                    p.expert_down,
+                    p.gemm1_h_buffer,
+                    p.gemm1_down_buffer,
+                    p.gemm1_load_empty_bars,
+                    p.gemm1_load_ready_bars,
+                    expert_idx,
+                    base_slot,
+                    base_h,
+                    p.EC,
+                    p.I,
+                    p.H,
+                    p.BLOCK_M,
+                    p.BLOCK_N,
+                    p.NUM_BUFFERS,
+                    p.shared_h_layout,
+                    p.shared_down_layout,
+                )
         task_id = _processor_wait_task_queue_role(
             p.processor_mailboxes,
             p.processor_seen,
@@ -2209,12 +2269,16 @@ def _local_ws_producer_loop_p(p):
             p.DEBUG,
             p.DEBUG_SCHED,
         )
+    if p.DEBUG:
+        gl.store(p.debug_state + 16 + pid, 800)
 
 
 @gluon.jit
 def _persistent_tdm_wmma_kernel(
     tokens,
     gate_weights,
+    topk_ids,
+    topk_weights,
     expert_up,
     bias_up,
     expert_up_v,
@@ -2229,6 +2293,7 @@ def _persistent_tdm_wmma_kernel(
     task_queue,
     task_head,
     task_tail,
+    gemm0_pending,
     tile_sync,
     processor_mailboxes,
     processor_seen,
@@ -2242,6 +2307,8 @@ def _persistent_tdm_wmma_kernel(
     E: gl.constexpr,
     EC: gl.constexpr,
     TOP_K: gl.constexpr,
+    PRECOMPUTED_ROUTING: gl.constexpr,
+    ZERO_OUTPUT: gl.constexpr,
     ACTIVATION: gl.constexpr,
     GATED: gl.constexpr,
     BLOCK_E: gl.constexpr,
@@ -2290,15 +2357,16 @@ def _persistent_tdm_wmma_kernel(
 
     if DEBUG:
         gl.store(debug_state + pid, 30)
-    out_base = pid * BLOCK_H
-    while out_base < S * H:
-        gl.store(
-            output + out_base + offs_h,
-            gl.full((BLOCK_H,), 0.0, gl.float32, layout=h_layout),
-            mask=out_base + offs_h < S * H,
-        )
-        out_base += NUM_PROGRAMS * BLOCK_H
-    _wait_storecnt0()
+    if ZERO_OUTPUT:
+        out_base = pid * BLOCK_H
+        while out_base < S * H:
+            gl.store(
+                output + out_base + offs_h,
+                gl.full((BLOCK_H,), 0.0, gl.float32, layout=h_layout),
+                mask=out_base + offs_h < S * H,
+            )
+            out_base += NUM_PROGRAMS * BLOCK_H
+        _wait_storecnt0()
     _persistent_phase_barrier(barriers, 0, NUM_PROGRAMS)
     if DEBUG:
         gl.store(debug_state + pid, 100)
@@ -2308,13 +2376,24 @@ def _persistent_tdm_wmma_kernel(
         zero_f = token_id.to(gl.float32) * 0.0
         zero_i = token_id * 0
 
-        top0_idx = zero_i
-        top1_idx = zero_i
-        top0_logit = zero_f - float("inf")
-        top1_logit = zero_f - float("inf")
-        for expert_id in gl.static_range(0, BLOCK_E):
-            if expert_id < E:
-                expert_id_t = zero_i + expert_id
+        if PRECOMPUTED_ROUTING:
+            route_id = zero_i
+            while route_id < TOP_K:
+                expert_idx = gl.load(topk_ids + token_id * TOP_K + route_id).to(gl.int32)
+                route_prob = gl.load(topk_weights + token_id * TOP_K + route_id).to(gl.float32)
+                slot = gl.atomic_add(expert_counts + expert_idx, 1, sem="relaxed", scope="gpu")
+                active = slot < EC
+                safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
+                gl.store(route_tokens + expert_idx * EC + safe_slot, token_id, mask=active)
+                gl.store(route_probs + expert_idx * EC + safe_slot, route_prob, mask=active)
+                route_id += 1
+        else:
+            top0_idx = zero_i
+            top1_idx = zero_i
+            top0_logit = zero_f - float("inf")
+            top1_logit = zero_f - float("inf")
+            expert_id = zero_i
+            while expert_id < E:
                 logit = zero_f
                 h_abs = zero_i
                 while h_abs < H:
@@ -2330,30 +2409,31 @@ def _persistent_tdm_wmma_kernel(
 
                 top1_idx = gl.where(better0, old_top0_idx, top1_idx)
                 top1_logit = gl.where(better0, old_top0_logit, top1_logit)
-                top0_idx = gl.where(better0, expert_id_t, top0_idx)
+                top0_idx = gl.where(better0, expert_id, top0_idx)
                 top0_logit = gl.where(better0, logit, top0_logit)
 
-                top1_idx = gl.where(better1, expert_id_t, top1_idx)
+                top1_idx = gl.where(better1, expert_id, top1_idx)
                 top1_logit = gl.where(better1, logit, top1_logit)
+                expert_id += 1
 
-        max_top = gl.maximum(top0_logit, top1_logit)
-        top0_exp = gl.exp(top0_logit - max_top)
-        top1_exp = gl.exp(top1_logit - max_top)
-        denom = top0_exp + top1_exp
+            max_top = gl.maximum(top0_logit, top1_logit)
+            top0_exp = gl.exp(top0_logit - max_top)
+            top1_exp = gl.exp(top1_logit - max_top)
+            denom = top0_exp + top1_exp
 
-        for route_id in gl.static_range(0, 2):
-            if route_id < TOP_K:
-                expert_idx = gl.where(route_id == 0, top0_idx, top1_idx)
-                route_prob = zero_f + 1.0
-                if TOP_K == 2:
-                    route_exp = gl.where(route_id == 0, top0_exp, top1_exp)
-                    route_prob = route_exp / denom
+            for route_id in gl.static_range(0, 2):
+                if route_id < TOP_K:
+                    expert_idx = gl.where(route_id == 0, top0_idx, top1_idx)
+                    route_prob = zero_f + 1.0
+                    if TOP_K == 2:
+                        route_exp = gl.where(route_id == 0, top0_exp, top1_exp)
+                        route_prob = route_exp / denom
 
-                slot = gl.atomic_add(expert_counts + expert_idx, 1, sem="relaxed", scope="gpu")
-                active = slot < EC
-                safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
-                gl.store(route_tokens + expert_idx * EC + safe_slot, token_id, mask=active)
-                gl.store(route_probs + expert_idx * EC + safe_slot, route_prob, mask=active)
+                    slot = gl.atomic_add(expert_counts + expert_idx, 1, sem="relaxed", scope="gpu")
+                    active = slot < EC
+                    safe_slot = gl.minimum(slot, slot * 0 + EC - 1)
+                    gl.store(route_tokens + expert_idx * EC + safe_slot, token_id, mask=active)
+                    gl.store(route_probs + expert_idx * EC + safe_slot, route_prob, mask=active)
 
         token_id += NUM_PROGRAMS
     _wait_loadcnt0()
@@ -2384,7 +2464,16 @@ def _persistent_tdm_wmma_kernel(
     gemm1_tasks: gl.constexpr = E * route_blocks * h_tiles
     total_tasks: gl.constexpr = gemm0_tasks + gemm1_tasks
     sync_slots: gl.constexpr = E * route_blocks
-    _init_dynamic_task_queue(task_queue, task_head, task_tail, tile_sync, gemm0_tasks, total_tasks, sync_slots)
+    _init_dynamic_task_queue(
+        task_queue,
+        task_head,
+        task_tail,
+        gemm0_pending,
+        tile_sync,
+        gemm0_tasks,
+        total_tasks,
+        sync_slots,
+    )
     _persistent_phase_barrier(barriers, 2, NUM_PROGRAMS)
     if DEBUG:
         gl.store(debug_state + pid, 300)
@@ -2456,6 +2545,7 @@ def _persistent_tdm_wmma_kernel(
         task_queue,
         task_head,
         task_tail,
+        gemm0_pending,
         tile_sync,
         processor_mailboxes,
         processor_seen,
@@ -2802,6 +2892,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                     rocshmem.ROCSHMEM_SIGNAL_SET,
                                     owner_pe_send,
                                 )
+                                rocshmem.quiet()
                             else:
                                 rocshmem.putmem_nbi_wg(
                                     dispatch_counts + channel_idx,
@@ -2831,6 +2922,7 @@ def _persistent_rocshmem_tdm_wmma_kernel(
                                     rocshmem.ROCSHMEM_SIGNAL_SET,
                                     owner_pe_send,
                                 )
+                                rocshmem.quiet()
                 if DEBUG:
                     gl.store(debug_state + 24, 2)
 
@@ -3327,6 +3419,28 @@ def forward_scalar_top1_debug(
     return out
 
 
+def _poll_tdm_heartbeat(debug_state: torch.Tensor, num_programs: int, *, label: str) -> None:
+    deadline = time.monotonic() + float(os.environ.get("FLASHMOE_HOST_POLL_TIMEOUT_S", "60"))
+    poll_interval_s = float(os.environ.get("FLASHMOE_HOST_POLL_INTERVAL_S", "0.05"))
+    while True:
+        state = debug_state[:num_programs].tolist()
+        if all(value == 999 for value in state):
+            break
+        if time.monotonic() > deadline:
+            compute_state = debug_state[8 : 8 + num_programs].tolist()
+            producer_state = debug_state[16 : 16 + num_programs].tolist()
+            compute_task = debug_state[40 : 40 + num_programs].tolist()
+            task_state = debug_state[48 : 48 + num_programs].tolist()
+            producer_task = debug_state[56 : 56 + num_programs].tolist()
+            raise TimeoutError(
+                f"{label} did not reach final heartbeat; "
+                f"state={state} compute_state={compute_state} "
+                f"producer_state={producer_state} task_state={task_state} "
+                f"compute_task={compute_task} producer_task={producer_task}"
+            )
+        time.sleep(poll_interval_s)
+
+
 def forward_megakernel(
     tokens: torch.Tensor,
     gate_weights: torch.Tensor,
@@ -3344,7 +3458,7 @@ def forward_megakernel(
     swish_beta: float = 1.0,
     block_h: Optional[int] = None,
     num_warps: int = 4,
-    num_programs: int = 2,
+    num_programs: int = 8,
     use_persistent: bool = True,
     use_tdm_wmma: bool = True,
     return_counts: bool = False,
@@ -3375,6 +3489,9 @@ def forward_megakernel(
     out = torch.empty((spec.s, spec.h), device=tokens.device, dtype=torch.float32)
     tdm_wmma_eligible = use_tdm_wmma and spec.top_k in (1, 2) and spec.h % 64 == 0 and spec.i % 64 == 0
 
+    if use_persistent and tdm_wmma_eligible:
+        num_programs = _resolve_tdm_num_programs(spec.dtype, spec.block_h, num_programs)
+
     if use_persistent:
         expert_counts = torch.empty((spec.e,), device=tokens.device, dtype=torch.int32)
         route_tokens = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.int32)
@@ -3398,17 +3515,26 @@ def forward_megakernel(
             task_queue = torch.empty((total_tasks,), device=tokens.device, dtype=torch.int32)
             task_head = torch.empty((1,), device=tokens.device, dtype=torch.int32)
             task_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+            gemm0_pending = torch.empty((1,), device=tokens.device, dtype=torch.int32)
             tile_sync = torch.empty((spec.e * route_blocks,), device=tokens.device, dtype=torch.int32)
             debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
             debug_sched_enabled = os.environ.get("FLASHMOE_DEBUG_SCHED", "0") == "1"
+            progress_heartbeat = os.environ.get("FLASHMOE_PROGRESS_HEARTBEAT", "0") == "1"
+            debug_len = max(64, 56 + num_programs)
             debug_state = (
-                torch.zeros((64,), dtype=torch.int32, pin_memory=True)
-                if debug_trace_enabled
+                torch.zeros((debug_len,), dtype=torch.int32, pin_memory=True)
+                if debug_trace_enabled or progress_heartbeat
                 else torch.empty((1,), device=tokens.device, dtype=torch.int32)
             )
-            setattr(forward_megakernel, "last_debug_state", debug_state if debug_trace_enabled else None)
+            setattr(
+                forward_megakernel,
+                "last_debug_state",
+                debug_state if debug_trace_enabled or progress_heartbeat else None,
+            )
             _persistent_tdm_wmma_kernel[(num_programs,)](
                 tokens,
+                gate_weights,
+                gate_weights,
                 gate_weights,
                 expert_up,
                 bias_up,
@@ -3424,6 +3550,7 @@ def forward_megakernel(
                 task_queue,
                 task_head,
                 task_tail,
+                gemm0_pending,
                 tile_sync,
                 processor_mailboxes,
                 processor_seen,
@@ -3437,6 +3564,8 @@ def forward_megakernel(
                 E=spec.e,
                 EC=spec.expert_capacity,
                 TOP_K=spec.top_k,
+                PRECOMPUTED_ROUTING=False,
+                ZERO_OUTPUT=True,
                 ACTIVATION=spec.activation,
                 GATED=spec.gated,
                 BLOCK_E=tdm_block_e,
@@ -3445,10 +3574,16 @@ def forward_megakernel(
                 BLOCK_N=64,
                 NUM_PROGRAMS=num_programs,
                 NUM_WARPS=spec.num_warps,
-                DEBUG=debug_trace_enabled,
+                DEBUG=debug_trace_enabled or progress_heartbeat,
                 DEBUG_SCHED=debug_sched_enabled,
                 num_warps=spec.num_warps,
             )
+            if progress_heartbeat and os.environ.get("FLASHMOE_HOST_POLL", "1") != "0":
+                _poll_tdm_heartbeat(
+                    debug_state,
+                    num_programs,
+                    label="Gluon megakernel",
+                )
             if return_counts:
                 return out, expert_counts
             return out
@@ -3512,6 +3647,237 @@ def forward_megakernel(
         NUM_WARPS=spec.num_warps,
         num_warps=spec.num_warps,
     )
+    return out
+
+
+def _validate_topk_common(
+    tokens: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_up: torch.Tensor,
+    expert_down: torch.Tensor,
+    bias_up: torch.Tensor,
+    bias_down: torch.Tensor,
+    *,
+    expert_capacity: Optional[int],
+    activation: int,
+    expert_up_v: Optional[torch.Tensor],
+    bias_up_v: Optional[torch.Tensor],
+    block_h: Optional[int],
+    num_warps: int,
+) -> MegakernelSpec:
+    if tokens.ndim != 2:
+        raise ValueError("tokens must be [S,H]")
+    if topk_ids.ndim != 2 or topk_weights.ndim != 2:
+        raise ValueError("topk_ids and topk_weights must be [S,top_k]")
+    if topk_ids.shape != topk_weights.shape or topk_ids.shape[0] != tokens.shape[0]:
+        raise ValueError("top-k routing tensors must match the token count")
+    if expert_up.ndim != 3 or expert_down.ndim != 3:
+        raise ValueError("expert_up must be [E,H,I], expert_down must be [E,I,H]")
+    if bias_up.ndim != 2 or bias_down.ndim != 2:
+        raise ValueError("bias_up must be [E,I] and bias_down must be [E,H]")
+    if tokens.device.type != "cuda":
+        raise ValueError("Gluon megakernel expects HIP/CUDA tensors on device")
+    if topk_ids.device != tokens.device or topk_weights.device != tokens.device:
+        raise ValueError("top-k routing tensors must live on the token device")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must be int32 or int64")
+    if topk_weights.dtype != torch.float32:
+        raise ValueError("topk_weights must be float32")
+    if activation not in (ACT_IDENTITY, ACT_SILU, ACT_GELU, ACT_RELU):
+        raise ValueError("unsupported activation")
+    if tokens.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("Gluon megakernel currently expects fp16 or bf16 tokens")
+    if expert_up.dtype != tokens.dtype or expert_down.dtype != tokens.dtype:
+        raise ValueError("tokens, expert_up, and expert_down must have the same dtype")
+    if bias_up.dtype != tokens.dtype or bias_down.dtype != tokens.dtype:
+        raise ValueError("bias tensors must have the same dtype as tokens")
+
+    s, h = tokens.shape
+    top_k = topk_ids.shape[1]
+    e, hup, i = expert_up.shape
+    ed, idown, hdown = expert_down.shape
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if hup != h or (ed, idown, hdown) != (e, i, h):
+        raise ValueError("token and expert tensor shapes are inconsistent")
+    if bias_up.shape != (e, i) or bias_down.shape != (e, h):
+        raise ValueError("bias tensor shapes are inconsistent with expert tensors")
+
+    gated = expert_up_v is not None
+    if gated:
+        if bias_up_v is None:
+            raise ValueError("bias_up_v is required when expert_up_v is provided")
+        if expert_up_v.shape != expert_up.shape or bias_up_v.shape != bias_up.shape:
+            raise ValueError("gated expert and bias tensors must match the up projection shapes")
+        if expert_up_v.dtype != tokens.dtype or bias_up_v.dtype != tokens.dtype:
+            raise ValueError("gated tensors must have the same dtype as tokens")
+    elif bias_up_v is not None:
+        raise ValueError("bias_up_v requires expert_up_v")
+
+    if expert_capacity is None:
+        expert_capacity = s * top_k
+    if expert_capacity <= 0:
+        raise ValueError("expert_capacity must be positive")
+    if num_warps != 4:
+        raise ValueError("precomputed-routing TDM/WMMA path requires num_warps=4")
+
+    resolved_block_h = _next_power_of_2(h) if block_h is None else block_h
+    if resolved_block_h < h:
+        raise ValueError("block_h must cover the full hidden dimension")
+
+    return MegakernelSpec(
+        s=s,
+        h=h,
+        i=i,
+        e=e,
+        top_k=top_k,
+        expert_capacity=expert_capacity,
+        activation=activation,
+        gated=gated,
+        dtype=tokens.dtype,
+        block_h=resolved_block_h,
+        num_warps=num_warps,
+    )
+
+
+def forward_megakernel_from_topk(
+    tokens: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    expert_up: torch.Tensor,
+    expert_down: torch.Tensor,
+    bias_up: torch.Tensor,
+    bias_down: torch.Tensor,
+    *,
+    expert_capacity: Optional[int] = None,
+    activation: int = ACT_IDENTITY,
+    expert_up_v: Optional[torch.Tensor] = None,
+    bias_up_v: Optional[torch.Tensor] = None,
+    block_h: Optional[int] = None,
+    num_warps: int = 4,
+    num_programs: int = 8,
+    return_counts: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    spec = _validate_topk_common(
+        tokens,
+        topk_ids,
+        topk_weights,
+        expert_up,
+        expert_down,
+        bias_up,
+        bias_down,
+        expert_capacity=expert_capacity,
+        activation=activation,
+        expert_up_v=expert_up_v,
+        bias_up_v=bias_up_v,
+        block_h=block_h,
+        num_warps=num_warps,
+    )
+    if num_programs < 2:
+        raise ValueError("persistent Gluon scheduling requires at least two programs")
+    if spec.h % 64 != 0 or spec.i % 64 != 0:
+        raise ValueError("precomputed-routing TDM/WMMA path requires H and I divisible by 64")
+    num_programs = _resolve_tdm_num_programs(spec.dtype, spec.block_h, num_programs)
+
+    up_v_arg = expert_up_v if expert_up_v is not None else expert_up
+    bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
+    out = torch.empty((spec.s, spec.h), device=tokens.device, dtype=torch.float32)
+    hidden = torch.empty(
+        (spec.e, spec.expert_capacity, spec.i),
+        device=tokens.device,
+        dtype=tokens.dtype,
+    )
+    block_m = 16
+    route_blocks = _ceil_div(spec.expert_capacity, block_m)
+    total_tasks = spec.e * route_blocks * ((spec.i // 64) + (spec.h // 64))
+    expert_counts = torch.empty((spec.e,), device=tokens.device, dtype=torch.int32)
+    route_tokens = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.int32)
+    route_probs = torch.empty((spec.e, spec.expert_capacity), device=tokens.device, dtype=torch.float32)
+    task_queue = torch.empty((total_tasks,), device=tokens.device, dtype=torch.int32)
+    task_head = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    task_tail = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    gemm0_pending = torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    tile_sync = torch.empty((spec.e * route_blocks,), device=tokens.device, dtype=torch.int32)
+    processor_mailboxes = torch.empty((num_programs,), device=tokens.device, dtype=torch.int32)
+    processor_seen = torch.empty((num_programs * 3,), device=tokens.device, dtype=torch.int32)
+    barriers = torch.empty((6,), device=tokens.device, dtype=torch.int32)
+    init_flag = torch.zeros((1,), device=tokens.device, dtype=torch.int32)
+    debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
+    debug_sched_enabled = os.environ.get("FLASHMOE_DEBUG_SCHED", "0") == "1"
+    # On gfx1250 the precomputed-routing persistent scheduler can occasionally
+    # fail to retire unless the host polls a heartbeat in pinned memory. Keep
+    # the stabilizer on by default for this path; profiling can still disable it.
+    progress_heartbeat = os.environ.get("FLASHMOE_PROGRESS_HEARTBEAT", "1") != "0"
+    debug_len = max(64, 56 + num_programs)
+    debug_state = (
+        torch.zeros((debug_len,), dtype=torch.int32, pin_memory=True)
+        if debug_trace_enabled or progress_heartbeat
+        else torch.empty((1,), device=tokens.device, dtype=torch.int32)
+    )
+    setattr(
+        forward_megakernel_from_topk,
+        "last_debug_state",
+        debug_state if debug_trace_enabled or progress_heartbeat else None,
+    )
+    # Keep this scalar stable so the JIT cache can be reused across calls.
+    # init_flag is zeroed above, so a constant non-zero epoch is sufficient.
+    launch_epoch = 1
+    _persistent_tdm_wmma_kernel[(num_programs,)](
+        tokens,
+        tokens,
+        topk_ids,
+        topk_weights,
+        expert_up,
+        bias_up,
+        up_v_arg,
+        bias_up_v_arg,
+        expert_down,
+        bias_down,
+        out,
+        hidden,
+        expert_counts,
+        route_tokens,
+        route_probs,
+        task_queue,
+        task_head,
+        task_tail,
+        gemm0_pending,
+        tile_sync,
+        processor_mailboxes,
+        processor_seen,
+        barriers,
+        init_flag,
+        debug_state,
+        launch_epoch,
+        S=spec.s,
+        H=spec.h,
+        I=spec.i,
+        E=spec.e,
+        EC=spec.expert_capacity,
+        TOP_K=spec.top_k,
+        PRECOMPUTED_ROUTING=True,
+        ZERO_OUTPUT=True,
+        ACTIVATION=spec.activation,
+        GATED=spec.gated,
+        BLOCK_E=spec.e,
+        BLOCK_H=spec.block_h,
+        BLOCK_M=block_m,
+        BLOCK_N=64,
+        NUM_PROGRAMS=num_programs,
+        NUM_WARPS=spec.num_warps,
+        DEBUG=debug_trace_enabled or progress_heartbeat,
+        DEBUG_SCHED=debug_sched_enabled,
+        num_warps=spec.num_warps,
+    )
+    if progress_heartbeat and os.environ.get("FLASHMOE_HOST_POLL", "1") != "0":
+        _poll_tdm_heartbeat(
+            debug_state,
+            num_programs,
+            label="Gluon precomputed-routing kernel",
+        )
+    if return_counts:
+        return out, expert_counts
     return out
 
 

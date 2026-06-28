@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import fcntl
 import faulthandler
 import os
 import select
@@ -20,6 +21,7 @@ import flashmoe_gluon as fmg
 from flashmoe_gluon.rocshmem_runtime import RocshmemMegakernelContext, RocshmemRuntime, create_uniqueid
 
 
+LOCK_PATH = Path(os.environ.get("FLASHMOE_ROCSHMEM_SMOKE_LOCK", "/tmp/flashmoe_rocshmem_smoke.lock"))
 WORLD = int(os.environ.get("FLASHMOE_WORLD", "2"))
 S = 1
 H = 64
@@ -42,6 +44,17 @@ def _allow_ptrace_attach() -> None:
     if ret != 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))
+
+
+class _SmokeRunLock:
+    def __enter__(self) -> None:
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._file = LOCK_PATH.open("w")
+        fcntl.flock(self._file, fcntl.LOCK_EX)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        fcntl.flock(self._file, fcntl.LOCK_UN)
+        self._file.close()
 
 
 def _reference(
@@ -244,6 +257,7 @@ def _worker() -> None:
                 "close",
                 close,
             )
+        runtime.barrier_all()
         ctx.close()
         runtime.barrier_all()
         runtime.finalize()
@@ -343,8 +357,9 @@ def main() -> None:
         cases.append(("remote10", 1))
     if args.case in ("all", "mixed"):
         cases.append(("mixed", 2))
-    for route_mode, top_k in cases:
-        _run_case(route_mode, top_k, args.timeout_s, args.repeats, args.activation, args.gated)
+    with _SmokeRunLock():
+        for route_mode, top_k in cases:
+            _run_case(route_mode, top_k, args.timeout_s, args.repeats, args.activation, args.gated)
 
 
 if __name__ == "__main__":

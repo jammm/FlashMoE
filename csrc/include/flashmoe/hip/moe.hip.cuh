@@ -379,8 +379,10 @@ constexpr auto kernelBlocks(const uint& S, const uint& H, const uint& I, const u
     const auto dispatchBlocks = cute::min(dispatchSuperBlockSize(E) * E, static_cast<uint>(MAX_DISPATCH_BLOCKS));
     auto maxVal = [](auto a, auto b) { return (a > b) ? a : b; };
     auto minVal = [](auto a, auto b) { return (a < b) ? a : b; };
+    const auto maxBlocks = minVal(static_cast<uint>(blocksPerSM * numSMs),
+        static_cast<uint>(scheduler::MAX_PROCESSORS + 1));
     return maxVal(minVal(maxVal(processorBlocks, dispatchBlocks) + 1,
-        static_cast<uint>(blocksPerSM * numSMs)), 2U);
+        maxBlocks), 2U);
 }
 
 // ============================================================================

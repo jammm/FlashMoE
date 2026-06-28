@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sysconfig
 from pathlib import Path
@@ -30,68 +31,82 @@ _WRAPPER_IR = r'''
 target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
 target triple = "amdgcn-amd-amdhsa"
 
-declare void @rocshmem_putmem_wg(ptr, ptr, i64, i32)
-declare void @rocshmem_putmem_wave(ptr, ptr, i64, i32)
-declare void @rocshmem_putmem_nbi_wg(ptr, ptr, i64, i32)
-declare void @rocshmem_getmem_wg(ptr, ptr, i64, i32)
-declare void @rocshmem_getmem_nbi_wg(ptr, ptr, i64, i32)
-declare void @rocshmem_putmem_signal_wg(ptr, ptr, i64, ptr, i64, i32, i32)
-declare void @rocshmem_putmem_signal_wave(ptr, ptr, i64, ptr, i64, i32, i32)
-declare void @rocshmem_putmem_signal_nbi_wg(ptr, ptr, i64, ptr, i64, i32, i32)
-declare void @rocshmem_uint64_atomic_set(ptr, i64, i32)
-declare void @rocshmem_uint64_atomic_add(ptr, i64, i32)
-declare void @rocshmem_uint64_wait_until(ptr, i32, i64)
-declare void @rocshmem_fence()
-declare void @rocshmem_quiet()
-declare void @rocshmem_barrier_all_wg()
-declare void @rocshmem_sync_all_wg()
+declare i32 @_ZN8rocshmem14rocshmem_my_peEv()
+declare i32 @_ZN8rocshmem14rocshmem_n_pesEv()
+declare void @_ZN8rocshmem18rocshmem_putmem_wgEPvPKvmi(ptr, ptr, i64, i32)
+declare void @_ZN8rocshmem20rocshmem_putmem_waveEPvPKvmi(ptr, ptr, i64, i32)
+declare void @_ZN8rocshmem22rocshmem_putmem_nbi_wgEPvPKvmi(ptr, ptr, i64, i32)
+declare void @_ZN8rocshmem18rocshmem_getmem_wgEPvPKvmi(ptr, ptr, i64, i32)
+declare void @_ZN8rocshmem22rocshmem_getmem_nbi_wgEPvPKvmi(ptr, ptr, i64, i32)
+declare void @_ZN8rocshmem25rocshmem_putmem_signal_wgEPvPKvmPmmii(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @_ZN8rocshmem27rocshmem_putmem_signal_waveEPvPKvmPmmii(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @_ZN8rocshmem29rocshmem_putmem_signal_nbi_wgEPvPKvmPmmii(ptr, ptr, i64, ptr, i64, i32, i32)
+declare void @_ZN8rocshmem26rocshmem_uint64_atomic_setEPmmi(ptr, i64, i32)
+declare void @_ZN8rocshmem26rocshmem_uint64_atomic_addEPmmi(ptr, i64, i32)
+declare void @_ZN8rocshmem26rocshmem_uint64_wait_untilEPmim(ptr, i32, i64)
+declare i64 @_ZN8rocshmem26rocshmem_signal_fetch_waveEPKm(ptr)
+declare void @_ZN8rocshmem14rocshmem_quietEv()
+declare void @_ZN8rocshmem23rocshmem_barrier_all_wgEv()
+declare void @_ZN8rocshmem20rocshmem_sync_all_wgEv()
 declare i32 @llvm.amdgcn.workitem.id.x()
+
+define i32 @fmg_rocshmem_my_pe() {
+entry:
+  %ret = call i32 @_ZN8rocshmem14rocshmem_my_peEv()
+  ret i32 %ret
+}
+
+define i32 @fmg_rocshmem_n_pes() {
+entry:
+  %ret = call i32 @_ZN8rocshmem14rocshmem_n_pesEv()
+  ret i32 %ret
+}
 
 define i32 @fmg_rocshmem_putmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
 entry:
-  call void @rocshmem_putmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  call void @_ZN8rocshmem18rocshmem_putmem_wgEPvPKvmi(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_putmem_wave(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
 entry:
-  call void @rocshmem_putmem_wave(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  call void @_ZN8rocshmem20rocshmem_putmem_waveEPvPKvmi(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_putmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
 entry:
-  call void @rocshmem_putmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  call void @_ZN8rocshmem22rocshmem_putmem_nbi_wgEPvPKvmi(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_getmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
 entry:
-  call void @rocshmem_getmem_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  call void @_ZN8rocshmem18rocshmem_getmem_wgEPvPKvmi(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_getmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe) {
 entry:
-  call void @rocshmem_getmem_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
+  call void @_ZN8rocshmem22rocshmem_getmem_nbi_wgEPvPKvmi(ptr %dest, ptr %source, i64 %nbytes, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_putmem_signal_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
 entry:
-  call void @rocshmem_putmem_signal_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  call void @_ZN8rocshmem25rocshmem_putmem_signal_wgEPvPKvmPmmii(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_putmem_signal_wave(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
 entry:
-  call void @rocshmem_putmem_signal_wave(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  call void @_ZN8rocshmem27rocshmem_putmem_signal_waveEPvPKvmPmmii(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_putmem_signal_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe) {
 entry:
-  call void @rocshmem_putmem_signal_nbi_wg(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
+  call void @_ZN8rocshmem29rocshmem_putmem_signal_nbi_wgEPvPKvmPmmii(ptr %dest, ptr %source, i64 %nbytes, ptr %sig_addr, i64 %signal, i32 %sig_op, i32 %pe)
   ret i32 0
 }
 
@@ -101,7 +116,7 @@ entry:
   br i1 %is_set, label %set, label %maybe_add
 
 set:
-  call void @rocshmem_uint64_atomic_set(ptr %sig_addr, i64 %signal, i32 %pe)
+  call void @_ZN8rocshmem26rocshmem_uint64_atomic_setEPmmi(ptr %sig_addr, i64 %signal, i32 %pe)
   br label %done
 
 maybe_add:
@@ -114,7 +129,7 @@ issue:
   br i1 %is_add, label %add, label %done
 
 add:
-  call void @rocshmem_uint64_atomic_add(ptr %sig_addr, i64 %signal, i32 %pe)
+  call void @_ZN8rocshmem26rocshmem_uint64_atomic_addEPmmi(ptr %sig_addr, i64 %signal, i32 %pe)
   br label %done
 
 done:
@@ -127,7 +142,7 @@ entry:
   br i1 %is_set, label %set, label %maybe_add
 
 set:
-  call void @rocshmem_uint64_atomic_set(ptr %sig_addr, i64 %signal, i32 %pe)
+  call void @_ZN8rocshmem26rocshmem_uint64_atomic_setEPmmi(ptr %sig_addr, i64 %signal, i32 %pe)
   br label %done
 
 maybe_add:
@@ -140,7 +155,7 @@ issue:
   br i1 %is_add, label %add, label %done
 
 add:
-  call void @rocshmem_uint64_atomic_add(ptr %sig_addr, i64 %signal, i32 %pe)
+  call void @_ZN8rocshmem26rocshmem_uint64_atomic_addEPmmi(ptr %sig_addr, i64 %signal, i32 %pe)
   br label %done
 
 done:
@@ -149,34 +164,62 @@ done:
 
 define i32 @fmg_rocshmem_uint64_wait_until(ptr %sig_addr, i32 %cmp_op, i64 %cmp_val) {
 entry:
-  call void @rocshmem_uint64_wait_until(ptr %sig_addr, i32 %cmp_op, i64 %cmp_val)
+  call void @_ZN8rocshmem26rocshmem_uint64_wait_untilEPmim(ptr %sig_addr, i32 %cmp_op, i64 %cmp_val)
   ret i32 0
 }
 
-define i32 @fmg_rocshmem_fence() {
+define i64 @fmg_rocshmem_signal_fetch_wave(ptr %sig_addr) {
 entry:
-  call void @rocshmem_fence()
-  ret i32 0
+  %ret = call i64 @_ZN8rocshmem26rocshmem_signal_fetch_waveEPKm(ptr %sig_addr)
+  ret i64 %ret
 }
 
 define i32 @fmg_rocshmem_quiet() {
 entry:
-  call void @rocshmem_quiet()
+  call void @_ZN8rocshmem14rocshmem_quietEv()
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_barrier_all_wg() {
 entry:
-  call void @rocshmem_barrier_all_wg()
+  call void @_ZN8rocshmem23rocshmem_barrier_all_wgEv()
   ret i32 0
 }
 
 define i32 @fmg_rocshmem_sync_all_wg() {
 entry:
-  call void @rocshmem_sync_all_wg()
+  call void @_ZN8rocshmem20rocshmem_sync_all_wgEv()
   ret i32 0
 }
 '''
+
+_WRAPPER_PUBLIC_API = (
+    "fmg_rocshmem_my_pe",
+    "fmg_rocshmem_n_pes",
+    "fmg_rocshmem_putmem_wg",
+    "fmg_rocshmem_putmem_wave",
+    "fmg_rocshmem_putmem_nbi_wg",
+    "fmg_rocshmem_getmem_wg",
+    "fmg_rocshmem_getmem_nbi_wg",
+    "fmg_rocshmem_putmem_signal_wg",
+    "fmg_rocshmem_putmem_signal_wave",
+    "fmg_rocshmem_putmem_signal_nbi_wg",
+    "fmg_rocshmem_signal_op_wg",
+    "fmg_rocshmem_signal_op_wave",
+    "fmg_rocshmem_uint64_wait_until",
+    "fmg_rocshmem_signal_fetch_wave",
+    "fmg_rocshmem_quiet",
+    "fmg_rocshmem_barrier_all_wg",
+    "fmg_rocshmem_sync_all_wg",
+    "_ZN8rocshmem18rocshmem_ctx_arrayE",
+    "_ZN8rocshmem20device_backend_proxyE",
+    "_ZN8rocshmem20ROCSHMEM_CTX_INVALIDE",
+    "_ZN8rocshmem14logd_constantsE",
+    "_ZN8rocshmem8constmemE",
+    "ROCSHMEM_CTX_DEFAULT",
+    "ROCSHMEM_TEAM_SHARED",
+    "ROCSHMEM_TEAM_WORLD",
+)
 
 
 def _rocm_root_from_sdk() -> str | None:
@@ -188,7 +231,30 @@ def _rocm_root_from_sdk() -> str | None:
     return path or None
 
 
-def find_device_bitcode(arch: str = "gfx1250") -> str:
+def _find_rocshmem_archive() -> str | None:
+    roots = [
+        os.environ.get("ROCSHMEM_LIB_DIR"),
+        os.environ.get("ROCM_ROOT"),
+        os.environ.get("ROCM_PATH"),
+        os.environ.get("ROCM_HOME"),
+        _rocm_root_from_sdk(),
+        str(Path(sysconfig.get_path("purelib")) / "_rocm_sdk_devel"),
+        "/opt/rocm",
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root:
+            continue
+        root_path = Path(root)
+        candidates.append(root_path / "librocshmem.a")
+        candidates.append(root_path / "lib" / "librocshmem.a")
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def _find_packaged_device_bitcode(arch: str) -> str | None:
     lib_name = f"librocshmem_device_{arch}.bc"
     roots = [
         os.environ.get("ROCSHMEM_LIB_DIR"),
@@ -209,11 +275,118 @@ def find_device_bitcode(arch: str = "gfx1250") -> str:
     for path in candidates:
         if path.exists():
             return str(path)
+    return None
+
+
+def _normalize_code_object_version(bitcode_path: Path, arch: str) -> Path:
+    ll_path = bitcode_path.with_suffix(f".{arch}.ll")
+    normalized_path = bitcode_path.with_suffix(f".{arch}.v5.bc")
+    subprocess.run([_find_llvm_tool("llvm-dis"), str(bitcode_path), "-o", str(ll_path)], check=True)
+    text = ll_path.read_text()
+    normalized = text.replace('!"amdhsa_code_object_version", i32 600', '!"amdhsa_code_object_version", i32 500')
+    if normalized != text:
+        ll_path.write_text(normalized)
+    subprocess.run([_find_llvm_tool("llvm-as"), str(ll_path), "-o", str(normalized_path)], check=True)
+    return normalized_path
+
+
+def _prune_abi_wrapper_bitcode(bitcode_path: Path, arch: str) -> Path:
+    opt = _find_llvm_tool("opt")
+    llvm_dis = _find_llvm_tool("llvm-dis")
+    llvm_as = _find_llvm_tool("llvm-as")
+    api_list = ",".join(_WRAPPER_PUBLIC_API)
+    internalized_path = bitcode_path.with_suffix(f".{arch}.internalized.bc")
+    demoted_ll_path = bitcode_path.with_suffix(f".{arch}.demoted.ll")
+    demoted_bc_path = bitcode_path.with_suffix(f".{arch}.demoted.bc")
+    pruned_path = bitcode_path.with_suffix(f".{arch}.pruned.bc")
+    subprocess.run(
+        [
+            opt,
+            "--passes=internalize,globaldce",
+            f"--internalize-public-api-list={api_list}",
+            str(bitcode_path),
+            "-o",
+            str(internalized_path),
+        ],
+        check=True,
+    )
+    subprocess.run([llvm_dis, str(internalized_path), "-o", str(demoted_ll_path)], check=True)
+    text = demoted_ll_path.read_text()
+    demoted = text.replace("define internal amdgpu_kernel void @", "define internal void @")
+    if demoted != text:
+        demoted_ll_path.write_text(demoted)
+    subprocess.run([llvm_as, str(demoted_ll_path), "-o", str(demoted_bc_path)], check=True)
+    subprocess.run([opt, "--passes=globaldce", str(demoted_bc_path), "-o", str(pruned_path)], check=True)
+    return pruned_path
+
+
+def find_device_bitcode(arch: str = "gfx1250") -> str:
+    archive = _find_rocshmem_archive()
+    if archive is not None:
+        archive_path = Path(archive)
+        stat = archive_path.stat()
+        digest_input = f"{archive_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{arch}:bundle-v2-cov5"
+        digest = hashlib.sha256(digest_input.encode()).hexdigest()[:16]
+        cache_root = Path(os.environ.get("FLASHMOE_ROCSHMEM_DEVICE_BC_CACHE", "/tmp/flashmoe_rocshmem_device_bc"))
+        build_dir = cache_root / digest
+        bc_path = build_dir / f"librocshmem_device_full_{arch}.bc"
+        if bc_path.exists():
+            return str(bc_path)
+
+        work_dir = build_dir / f"work-{os.getpid()}"
+        shutil.rmtree(work_dir, ignore_errors=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run([_find_llvm_tool("llvm-ar"), "x", str(archive_path)], cwd=work_dir, check=True)
+        objcopy = _find_llvm_tool("llvm-objcopy")
+        bitcodes: list[str] = []
+        section = f"__CLANG_OFFLOAD_BUNDLE__hip-amdgcn-amd-amdhsa--{arch}"
+        for obj_path in sorted(work_dir.glob("*.o")):
+            out_path = work_dir / f"{obj_path.stem}.{arch}.bc"
+            result = subprocess.run(
+                [objcopy, "--dump-section", f"{section}={out_path}", str(obj_path)],
+                cwd=work_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                bitcodes.append(str(out_path))
+        if not bitcodes:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise FileNotFoundError(f"could not extract {arch} device bitcode from {archive_path}")
+
+        tmp_bc = work_dir / f"{bc_path.name}.tmp"
+        subprocess.run([_find_llvm_tool("llvm-link"), *bitcodes, "-o", str(tmp_bc)], check=True)
+        normalized_bc = _normalize_code_object_version(tmp_bc, arch)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(normalized_bc, bc_path)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return str(bc_path)
+
+    packaged = _find_packaged_device_bitcode(arch)
+    if packaged is not None:
+        return packaged
+    lib_name = f"librocshmem_device_{arch}.bc"
+    roots = [
+        os.environ.get("ROCSHMEM_LIB_DIR"),
+        os.environ.get("ROCM_ROOT"),
+        os.environ.get("ROCM_PATH"),
+        os.environ.get("ROCM_HOME"),
+        _rocm_root_from_sdk(),
+        str(Path(sysconfig.get_path("purelib")) / "_rocm_sdk_devel"),
+        "/opt/rocm",
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root:
+            continue
+        root_path = Path(root)
+        candidates.append(root_path / lib_name)
+        candidates.append(root_path / "lib" / lib_name)
     searched = ", ".join(str(path) for path in candidates)
     raise FileNotFoundError(f"could not find {lib_name}; searched: {searched}")
 
 
-def _find_llvm_as() -> str:
+def _find_llvm_tool(tool: str) -> str:
     roots = [
         _rocm_root_from_sdk(),
         str(Path(sysconfig.get_path("purelib")) / "_rocm_sdk_devel"),
@@ -227,17 +400,20 @@ def _find_llvm_as() -> str:
         if not root:
             continue
         root_path = Path(root)
-        candidates.append(root_path / "lib" / "llvm" / "bin" / "llvm-as")
-        candidates.append(root_path / "bin" / "llvm-as")
+        candidates.append(root_path / "lib" / "llvm" / "bin" / tool)
+        candidates.append(root_path / "bin" / tool)
     for path in candidates:
         if path.exists():
             return str(path)
     searched = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"could not find llvm-as; searched: {searched}")
+    raise FileNotFoundError(f"could not find {tool}; searched: {searched}")
 
 
 def find_abi_wrapper_bitcode(arch: str = "gfx1250") -> str:
-    digest = hashlib.sha256((_WRAPPER_IR + arch).encode()).hexdigest()[:16]
+    device_bc = Path(find_device_bitcode(arch))
+    stat = device_bc.stat()
+    digest_input = f"{_WRAPPER_IR}:{arch}:{device_bc.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:fat-v3-cov5-pruned"
+    digest = hashlib.sha256(digest_input.encode()).hexdigest()[:16]
     cache_root = Path(os.environ.get("FLASHMOE_ROCSHMEM_ABI_CACHE", "/tmp/flashmoe_rocshmem_abi"))
     build_dir = cache_root / digest
     bc_path = build_dir / f"fmg_rocshmem_abi_{arch}.bc"
@@ -245,16 +421,18 @@ def find_abi_wrapper_bitcode(arch: str = "gfx1250") -> str:
         return str(bc_path)
     build_dir.mkdir(parents=True, exist_ok=True)
     ir_path = build_dir / f"fmg_rocshmem_abi_{arch}.ll"
+    wrapper_bc_path = build_dir / f"fmg_rocshmem_abi_wrapper_{arch}.bc"
+    tmp_bc_path = build_dir / f"{bc_path.name}.{os.getpid()}.tmp"
     ir_path.write_text(_WRAPPER_IR)
-    subprocess.run([_find_llvm_as(), str(ir_path), "-o", str(bc_path)], check=True)
+    subprocess.run([_find_llvm_tool("llvm-as"), str(ir_path), "-o", str(wrapper_bc_path)], check=True)
+    subprocess.run([_find_llvm_tool("llvm-link"), str(wrapper_bc_path), str(device_bc), "-o", str(tmp_bc_path)], check=True)
+    pruned_bc_path = _prune_abi_wrapper_bitcode(tmp_bc_path, arch)
+    os.replace(pruned_bc_path, bc_path)
     return str(bc_path)
 
 
 def extern_libs(arch: str = "gfx1250") -> dict[str, str]:
-    return {
-        _WRAPPER_LIB_NAME: find_abi_wrapper_bitcode(arch),
-        _LIB_NAME: find_device_bitcode(arch),
-    }
+    return {_WRAPPER_LIB_NAME: find_abi_wrapper_bitcode(arch)}
 
 
 def launch_kwargs(arch: str = "gfx1250") -> dict[str, dict[str, str]]:
@@ -371,10 +549,10 @@ def set_ctx(ctx, _semantic=None):
 @builtin
 def my_pe(_semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("rocshmem_my_pe", gl.int32)},
+        {(): ("fmg_rocshmem_my_pe", gl.int32)},
         is_pure=True,
         _semantic=_semantic,
     )
@@ -383,10 +561,10 @@ def my_pe(_semantic=None):
 @builtin
 def n_pes(_semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("rocshmem_n_pes", gl.int32)},
+        {(): ("fmg_rocshmem_n_pes", gl.int32)},
         is_pure=True,
         _semantic=_semantic,
     )
@@ -605,12 +783,12 @@ def signal_wait_until(sig_addr, cmp_op, cmp_val, _semantic=None):
 @builtin
 def signal_fetch_wave(sig_addr, _semantic=None):
     return extern_call(
-        _LIB_NAME,
+        _WRAPPER_LIB_NAME,
         "",
         [
             gl.cast(sig_addr, _U64_PTR, _semantic=_semantic),
         ],
-        (((_U64_PTR,), ("rocshmem_signal_fetch_wave", gl.uint64)),),
+        (((_U64_PTR,), ("fmg_rocshmem_signal_fetch_wave", gl.uint64)),),
         is_pure=False,
         _semantic=_semantic,
     )
@@ -618,11 +796,13 @@ def signal_fetch_wave(sig_addr, _semantic=None):
 
 @builtin
 def fence(_semantic=None):
+    # ROCm 7.15 gfx1250 device rocshmem_fence* deadlocks even with no prior RMA.
+    # quiet is stronger than fence and preserves the publish-before-signal contract.
     return extern_call(
         _WRAPPER_LIB_NAME,
         "",
         [],
-        {(): ("fmg_rocshmem_fence", gl.int32)},
+        {(): ("fmg_rocshmem_quiet", gl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )

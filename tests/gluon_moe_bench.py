@@ -12,7 +12,7 @@ from triton.runtime.jit import MockTensor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashmoe_gluon as fmg
-from flashmoe_gluon.megakernel import _persistent_tdm_wmma_kernel
+from flashmoe_gluon.megakernel import _persistent_tdm_wmma_kernel, _resolve_tdm_num_programs
 
 
 _ACTIVATIONS = {
@@ -116,6 +116,8 @@ def _precompile_tdm_wmma(
         kernel_args = (
             _mock(dtype, args.s, args.h),
             _mock(dtype, args.h, args.e),
+            _mock(torch.int32, args.s, args.top_k),
+            _mock(torch.float32, args.s, args.top_k),
             _mock(dtype, args.e, args.h, args.i),
             _mock(dtype, args.e, args.i),
             _mock(dtype, args.e, args.h, args.i),
@@ -128,6 +130,7 @@ def _precompile_tdm_wmma(
             _mock(torch.int32, args.e, args.expert_capacity),
             _mock(torch.float32, args.e, args.expert_capacity),
             _mock(torch.int32, total_tasks),
+            _mock(torch.int32, 1),
             _mock(torch.int32, 1),
             _mock(torch.int32, 1),
             _mock(torch.int32, args.e * route_blocks),
@@ -144,6 +147,8 @@ def _precompile_tdm_wmma(
         kernel_args = (
             tokens,
             gate,
+            torch.empty((args.s, args.top_k), device=tokens.device, dtype=torch.int32),
+            torch.empty((args.s, args.top_k), device=tokens.device, dtype=torch.float32),
             up,
             bias_up,
             up_v_arg,
@@ -156,6 +161,7 @@ def _precompile_tdm_wmma(
             torch.empty((args.e, args.expert_capacity), device=tokens.device, dtype=torch.int32),
             torch.empty((args.e, args.expert_capacity), device=tokens.device, dtype=torch.float32),
             torch.empty((total_tasks,), device=tokens.device, dtype=torch.int32),
+            torch.empty((1,), device=tokens.device, dtype=torch.int32),
             torch.empty((1,), device=tokens.device, dtype=torch.int32),
             torch.empty((1,), device=tokens.device, dtype=torch.int32),
             torch.empty((args.e * route_blocks,), device=tokens.device, dtype=torch.int32),
@@ -176,6 +182,8 @@ def _precompile_tdm_wmma(
         E=args.e,
         EC=args.expert_capacity,
         TOP_K=args.top_k,
+        PRECOMPUTED_ROUTING=False,
+        ZERO_OUTPUT=True,
         ACTIVATION=_ACTIVATIONS[args.activation],
         GATED=args.gated,
         BLOCK_E=args.e,
@@ -332,12 +340,32 @@ def main() -> None:
     parser.add_argument("--static-profile", action="store_true")
     parser.add_argument("--disable-tdm-wmma", action="store_true")
     parser.add_argument("--check-finite", action="store_true")
+    parser.add_argument(
+        "--timing",
+        choices=("host", "event"),
+        default="host",
+        help="host uses synchronized wall time; event uses torch.cuda.Event timing",
+    )
     args = parser.parse_args()
 
     if args.repeats <= 0:
         raise ValueError("--repeats must be positive")
     if args.warmup < 0:
         raise ValueError("--warmup must be non-negative")
+
+    requested_num_programs = args.num_programs
+    args.num_programs = _resolve_tdm_num_programs(
+        _dtype_from_name(args.dtype),
+        args.block_h if args.block_h is not None else _next_power_of_2(args.h),
+        args.num_programs,
+    )
+    if args.num_programs != requested_num_programs:
+        print(
+            "effective_num_programs",
+            args.num_programs,
+            "requested",
+            requested_num_programs,
+        )
 
     if args.precompile_only:
         precompile_ms, kernel = _precompile_tdm_wmma(args)
@@ -401,25 +429,37 @@ def main() -> None:
     counts = None
     for repeat_idx in range(args.repeats):
         torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        host_start = time.perf_counter()
-        result = _run_megakernel(args, tensors, return_counts=(repeat_idx == args.repeats - 1))
-        host_end = time.perf_counter()
-        end_event.record()
-        torch.cuda.synchronize()
+        if args.timing == "event":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            host_start = time.perf_counter()
+            result = _run_megakernel(args, tensors, return_counts=(repeat_idx == args.repeats - 1))
+            host_end = time.perf_counter()
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            host_elapsed_ms = (host_end - host_start) * 1000.0
+        else:
+            host_start = time.perf_counter()
+            result = _run_megakernel(args, tensors, return_counts=(repeat_idx == args.repeats - 1))
+            torch.cuda.synchronize()
+            host_end = time.perf_counter()
+            elapsed_ms = (host_end - host_start) * 1000.0
+            host_elapsed_ms = elapsed_ms
         if repeat_idx == args.repeats - 1:
             out, counts = result
         else:
             out = result
-        event_times_ms.append(start_event.elapsed_time(end_event))
-        host_times_ms.append((host_end - host_start) * 1000.0)
+        event_times_ms.append(elapsed_ms)
+        host_times_ms.append(host_elapsed_ms)
 
     assert out is not None
     assert counts is not None
-    if args.check_finite and not bool(torch.isfinite(out).all().item()):
-        raise SystemExit("output contains non-finite values")
+    if args.check_finite:
+        out_cpu = out.detach().cpu()
+        if not bool(torch.isfinite(out_cpu).all().item()):
+            raise SystemExit("output contains non-finite values")
 
     dtype = _dtype_from_name(args.dtype)
     work = _estimate_work(args, counts, dtype=dtype)
@@ -451,6 +491,8 @@ def main() -> None:
     )
     print(
         "timing",
+        "mode",
+        args.timing,
         "event_median_ms",
         f"{median_ms:.3f}",
         "event_min_ms",
