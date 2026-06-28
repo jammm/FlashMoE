@@ -512,10 +512,10 @@ def _persistent_tdm_wmma_kernel(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    gl.static_assert(H == 64, "TDM/WMMA path currently expects H=64")
-    gl.static_assert(I == 64, "TDM/WMMA path currently expects I=64")
     gl.static_assert(BLOCK_M % 16 == 0, "TDM/WMMA path expects a WMMA-row-aligned BLOCK_M")
-    gl.static_assert(BLOCK_N == 64, "TDM/WMMA path currently expects BLOCK_N=64")
+    gl.static_assert(BLOCK_N == 64, "TDM/WMMA path expects 64-column tiles")
+    gl.static_assert(H % BLOCK_N == 0, "TDM/WMMA path expects H to be divisible by 64")
+    gl.static_assert(I % BLOCK_N == 0, "TDM/WMMA path expects I to be divisible by 64")
 
     pid = gl.program_id(0)
     h_layout: gl.constexpr = _hidden_layout(NUM_WARPS)
@@ -612,22 +612,28 @@ def _persistent_tdm_wmma_kernel(
     wmma_layout: gl.constexpr = _wmma_layout(NUM_WARPS)
     dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
     dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
-    shared_a_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, H)
-    shared_b_layout: gl.constexpr = _wmma_shared_b_layout(H, I)
-    shared_h_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, I)
-    shared_down_layout: gl.constexpr = _wmma_shared_b_layout(I, H)
+    shared_a_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, BLOCK_N)
+    shared_b_layout: gl.constexpr = _wmma_shared_b_layout(BLOCK_N, BLOCK_N)
+    shared_h_layout: gl.constexpr = _wmma_shared_a_layout(BLOCK_M, BLOCK_N)
+    shared_down_layout: gl.constexpr = _wmma_shared_b_layout(BLOCK_N, BLOCK_N)
     route_layout: gl.constexpr = _route_index_layout(BLOCK_M, NUM_WARPS)
     route_offs = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, route_layout))
 
     route_blocks: gl.constexpr = (EC + BLOCK_M - 1) // BLOCK_M
+    h_tiles: gl.constexpr = H // BLOCK_N
+    i_tiles: gl.constexpr = I // BLOCK_N
+    gemm0_tasks: gl.constexpr = E * route_blocks * i_tiles
     if pid == 0:
-        _scheduler_run(processor_ready, processor_mailboxes, E * route_blocks, NUM_PROGRAMS)
+        _scheduler_run(processor_ready, processor_mailboxes, gemm0_tasks, NUM_PROGRAMS)
     else:
         task_id = _processor_next_task(processor_ready, processor_mailboxes)
-        while task_id < E * route_blocks:
-            expert_idx = task_id // route_blocks
-            route_block = task_id - expert_idx * route_blocks
+        while task_id < gemm0_tasks:
+            expert_idx = task_id // (route_blocks * i_tiles)
+            rem_task = task_id - expert_idx * route_blocks * i_tiles
+            route_block = rem_task // i_tiles
+            i_tile = rem_task - route_block * i_tiles
             base_slot = route_block * BLOCK_M
+            base_i = i_tile * BLOCK_N
             expert_count = gl.load(expert_counts + expert_idx)
             active_rows = base_slot + route_offs < gl.minimum(expert_count, expert_count * 0 + EC)
             safe_route_rows = gl.minimum(base_slot + route_offs, route_offs * 0 + EC - 1)
@@ -637,51 +643,74 @@ def _persistent_tdm_wmma_kernel(
                 other=0,
             ).to(gl.int32)
 
-            x_desc = tdm.make_tensor_descriptor(
-                base=tokens,
-                shape=(S, H),
-                strides=(H, 1),
-                block_shape=(BLOCK_M, H),
+            x_smem = gl.allocate_shared_memory(
+                tokens.dtype.element_ty,
+                shape=[BLOCK_M, BLOCK_N],
                 layout=shared_a_layout,
             )
-            w_desc = tdm.make_tensor_descriptor(
-                base=expert_up + expert_idx * H * I,
-                shape=(H, I),
-                strides=(I, 1),
-                block_shape=(H, I),
+            w_smem = gl.allocate_shared_memory(
+                expert_up.dtype.element_ty,
+                shape=[BLOCK_N, BLOCK_N],
                 layout=shared_b_layout,
             )
-            x_smem = gl.allocate_shared_memory(tokens.dtype.element_ty, shape=[BLOCK_M, H], layout=shared_a_layout)
-            w_smem = gl.allocate_shared_memory(expert_up.dtype.element_ty, shape=[H, I], layout=shared_b_layout)
-            tdm.async_gather(x_desc, gathered_tokens, x_smem)
-            tdm.async_load(w_desc, [0, 0], w_smem)
-            _tdm_wait(0)
-            x_frag = x_smem.load(layout=dot_a)
-            w_frag = w_smem.load(layout=dot_b)
-            acc = gl.zeros((BLOCK_M, I), dtype=gl.float32, layout=wmma_layout)
-            acc = gl.amd.gfx1250.wmma(x_frag, w_frag, acc)
+            acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
+            for h_tile in gl.static_range(0, h_tiles):
+                x_desc = tdm.make_tensor_descriptor(
+                    base=tokens + h_tile * BLOCK_N,
+                    shape=(S, BLOCK_N),
+                    strides=(H, 1),
+                    block_shape=(BLOCK_M, BLOCK_N),
+                    layout=shared_a_layout,
+                )
+                w_desc = tdm.make_tensor_descriptor(
+                    base=expert_up + expert_idx * H * I + (h_tile * BLOCK_N) * I + base_i,
+                    shape=(BLOCK_N, BLOCK_N),
+                    strides=(I, 1),
+                    block_shape=(BLOCK_N, BLOCK_N),
+                    layout=shared_b_layout,
+                )
+                tdm.async_gather(x_desc, gathered_tokens, x_smem)
+                tdm.async_load(w_desc, [0, 0], w_smem)
+                _tdm_wait(0)
+                x_frag = x_smem.load(layout=dot_a)
+                w_frag = w_smem.load(layout=dot_b)
+                acc = gl.amd.gfx1250.wmma(x_frag, w_frag, acc)
 
             bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
-            offs_i = gl.arange(0, I, layout=bias_layout)
+            offs_i = base_i + gl.arange(0, BLOCK_N, layout=bias_layout)
             bias = gl.load(bias_up + expert_idx * I + offs_i).to(gl.float32)
             bias_2d = gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout)
             acc += bias_2d
             hidden_acc = _apply_activation(acc, ACTIVATION)
 
             if GATED:
-                wv_desc = tdm.make_tensor_descriptor(
-                    base=expert_up_v + expert_idx * H * I,
-                    shape=(H, I),
-                    strides=(I, 1),
-                    block_shape=(H, I),
+                wv_smem = gl.allocate_shared_memory(
+                    expert_up_v.dtype.element_ty,
+                    shape=[BLOCK_N, BLOCK_N],
                     layout=shared_b_layout,
                 )
-                wv_smem = gl.allocate_shared_memory(expert_up_v.dtype.element_ty, shape=[H, I], layout=shared_b_layout)
-                tdm.async_load(wv_desc, [0, 0], wv_smem)
-                _tdm_wait(0)
-                wv_frag = wv_smem.load(layout=dot_b)
-                acc_v = gl.zeros((BLOCK_M, I), dtype=gl.float32, layout=wmma_layout)
-                acc_v = gl.amd.gfx1250.wmma(x_frag, wv_frag, acc_v)
+                acc_v = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
+                for h_tile_v in gl.static_range(0, h_tiles):
+                    x_desc = tdm.make_tensor_descriptor(
+                        base=tokens + h_tile_v * BLOCK_N,
+                        shape=(S, BLOCK_N),
+                        strides=(H, 1),
+                        block_shape=(BLOCK_M, BLOCK_N),
+                        layout=shared_a_layout,
+                    )
+                    wv_desc = tdm.make_tensor_descriptor(
+                        base=expert_up_v + expert_idx * H * I + (h_tile_v * BLOCK_N) * I + base_i,
+                        shape=(BLOCK_N, BLOCK_N),
+                        strides=(I, 1),
+                        block_shape=(BLOCK_N, BLOCK_N),
+                        layout=shared_b_layout,
+                    )
+                    tdm.async_gather(x_desc, gathered_tokens, x_smem)
+                    tdm.async_load(wv_desc, [0, 0], wv_smem)
+                    _tdm_wait(0)
+                    x_frag = x_smem.load(layout=dot_a)
+                    wv_frag = wv_smem.load(layout=dot_b)
+                    acc_v = gl.amd.gfx1250.wmma(x_frag, wv_frag, acc_v)
                 bias_v = gl.load(bias_up_v + expert_idx * I + offs_i).to(gl.float32)
                 bias_v_2d = gl.convert_layout(gl.expand_dims(bias_v, 0), wmma_layout)
                 acc_v += bias_v_2d
@@ -689,7 +718,7 @@ def _persistent_tdm_wmma_kernel(
 
             rows = base_slot + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, wmma_layout))
             safe_rows = gl.minimum(rows, rows * 0 + EC - 1)
-            cols = gl.arange(0, I, layout=gl.SliceLayout(0, wmma_layout))
+            cols = base_i + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, wmma_layout))
             rows_2d = gl.expand_dims(safe_rows, 1)
             raw_rows_2d = gl.expand_dims(rows, 1)
             cols_2d = gl.expand_dims(cols, 0)
@@ -709,47 +738,60 @@ def _persistent_tdm_wmma_kernel(
     _scheduler_reset(processor_ready, processor_mailboxes, NUM_PROGRAMS)
     _persistent_phase_barrier(barriers, 4, NUM_PROGRAMS)
 
+    gemm1_tasks: gl.constexpr = E * route_blocks * h_tiles
     if pid == 0:
-        _scheduler_run(processor_ready, processor_mailboxes, E * route_blocks, NUM_PROGRAMS)
+        _scheduler_run(processor_ready, processor_mailboxes, gemm1_tasks, NUM_PROGRAMS)
     else:
         task_id = _processor_next_task(processor_ready, processor_mailboxes)
-        while task_id < E * route_blocks:
-            expert_idx = task_id // route_blocks
-            route_block = task_id - expert_idx * route_blocks
+        while task_id < gemm1_tasks:
+            expert_idx = task_id // (route_blocks * h_tiles)
+            rem_task = task_id - expert_idx * route_blocks * h_tiles
+            route_block = rem_task // h_tiles
+            h_tile = rem_task - route_block * h_tiles
             base_slot = route_block * BLOCK_M
+            base_h = h_tile * BLOCK_N
             expert_count = gl.load(expert_counts + expert_idx)
 
-            h_desc = tdm.make_tensor_descriptor(
-                base=hidden + expert_idx * EC * I + base_slot * I,
-                shape=(EC, I),
-                strides=(I, 1),
-                block_shape=(BLOCK_M, I),
+            h_smem = gl.allocate_shared_memory(
+                hidden.dtype.element_ty,
+                shape=[BLOCK_M, BLOCK_N],
                 layout=shared_h_layout,
             )
-            down_desc = tdm.make_tensor_descriptor(
-                base=expert_down + expert_idx * I * H,
-                shape=(I, H),
-                strides=(H, 1),
-                block_shape=(I, H),
+            down_smem = gl.allocate_shared_memory(
+                expert_down.dtype.element_ty,
+                shape=[BLOCK_N, BLOCK_N],
                 layout=shared_down_layout,
             )
-            h_smem = gl.allocate_shared_memory(hidden.dtype.element_ty, shape=[BLOCK_M, I], layout=shared_h_layout)
-            down_smem = gl.allocate_shared_memory(expert_down.dtype.element_ty, shape=[I, H], layout=shared_down_layout)
-            tdm.async_load(h_desc, [0, 0], h_smem)
-            tdm.async_load(down_desc, [0, 0], down_smem)
-            _tdm_wait(0)
-            h_frag = h_smem.load(layout=dot_a)
-            down_frag = down_smem.load(layout=dot_b)
-            acc = gl.zeros((BLOCK_M, H), dtype=gl.float32, layout=wmma_layout)
-            acc = gl.amd.gfx1250.wmma(h_frag, down_frag, acc)
+            acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_layout)
+            for i_tile_down in gl.static_range(0, i_tiles):
+                h_desc = tdm.make_tensor_descriptor(
+                    base=hidden + expert_idx * EC * I + base_slot * I + i_tile_down * BLOCK_N,
+                    shape=(EC, BLOCK_N),
+                    strides=(I, 1),
+                    block_shape=(BLOCK_M, BLOCK_N),
+                    layout=shared_h_layout,
+                )
+                down_desc = tdm.make_tensor_descriptor(
+                    base=expert_down + expert_idx * I * H + (i_tile_down * BLOCK_N) * H + base_h,
+                    shape=(BLOCK_N, BLOCK_N),
+                    strides=(H, 1),
+                    block_shape=(BLOCK_N, BLOCK_N),
+                    layout=shared_down_layout,
+                )
+                tdm.async_load(h_desc, [0, 0], h_smem)
+                tdm.async_load(down_desc, [0, 0], down_smem)
+                _tdm_wait(0)
+                h_frag = h_smem.load(layout=dot_a)
+                down_frag = down_smem.load(layout=dot_b)
+                acc = gl.amd.gfx1250.wmma(h_frag, down_frag, acc)
 
             bias_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
-            offs_out = gl.arange(0, H, layout=bias_layout)
+            offs_out = base_h + gl.arange(0, BLOCK_N, layout=bias_layout)
             bias = gl.load(bias_down + expert_idx * H + offs_out).to(gl.float32)
             bias_2d = gl.convert_layout(gl.expand_dims(bias, 0), wmma_layout)
             acc += bias_2d
 
-            cols = gl.arange(0, H, layout=gl.SliceLayout(0, wmma_layout))
+            cols = base_h + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, wmma_layout))
             route_rows = base_slot + route_offs
             safe_route_rows = gl.minimum(route_rows, route_rows * 0 + EC - 1)
             active_route_rows = route_rows < gl.minimum(expert_count, expert_count * 0 + EC)
@@ -993,7 +1035,7 @@ def forward_megakernel(
     up_v_arg = expert_up_v if expert_up_v is not None else expert_up
     bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
     out = torch.empty((spec.s, spec.h), device=tokens.device, dtype=torch.float32)
-    tdm_wmma_eligible = use_tdm_wmma and spec.top_k in (1, 2) and spec.h == 64 and spec.i == 64
+    tdm_wmma_eligible = use_tdm_wmma and spec.top_k in (1, 2) and spec.h % 64 == 0 and spec.i % 64 == 0
 
     if use_persistent:
         expert_counts = torch.empty((spec.e,), device=tokens.device, dtype=torch.int32)
