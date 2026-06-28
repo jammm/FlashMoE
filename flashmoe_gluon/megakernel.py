@@ -19,6 +19,8 @@ ACT_SILU = 1
 ACT_GELU = 2
 ACT_RELU = 3
 
+_tdm_wmma_8cta_prime_keys: set[tuple[object, ...]] = set()
+
 
 @dataclass(frozen=True)
 class MegakernelSpec:
@@ -51,6 +53,54 @@ def _resolve_tdm_num_programs(dtype: torch.dtype, block_h: int, requested: int) 
     if 2 < resolved < 8:
         return 2
     return resolved
+
+
+def _resolve_precomputed_tdm_num_programs(spec: MegakernelSpec, requested: int) -> int:
+    resolved = _resolve_tdm_num_programs(spec.dtype, spec.block_h, requested)
+    precomputed_max = os.environ.get("FLASHMOE_TDM_PRECOMPUTED_MAX_PROGRAMS")
+    if precomputed_max is not None:
+        resolved = min(resolved, int(precomputed_max))
+    # Precomputed kernels can require more resources per CTA than the runtime
+    # can make resident at an 8-CTA barrier on gfx1250.
+    if resolved >= 8 and os.environ.get("FLASHMOE_TDM_PRECOMPUTED_UNSAFE_8CTA", "0") != "1":
+        return 2
+    return resolved
+
+
+def _tdm_wmma_8cta_prime_key(
+    kind: str,
+    device: torch.device,
+    spec: MegakernelSpec,
+    debug_enabled: bool,
+) -> tuple[object, ...]:
+    return (
+        kind,
+        str(device),
+        spec.s,
+        spec.h,
+        spec.i,
+        spec.e,
+        spec.top_k,
+        spec.expert_capacity,
+        spec.activation,
+        spec.gated,
+        spec.dtype,
+        spec.block_h,
+        spec.num_warps,
+        debug_enabled,
+    )
+
+
+def _tdm_wmma_8cta_prime_enabled() -> bool:
+    return os.environ.get("FLASHMOE_TDM_PRIME_8CTA", "1") != "0"
+
+
+def _router_progress_heartbeat_enabled(spec: MegakernelSpec) -> bool:
+    requested = os.environ.get("FLASHMOE_PROGRESS_HEARTBEAT")
+    if requested is not None:
+        return requested == "1"
+    min_tokens = int(os.environ.get("FLASHMOE_TDM_HEARTBEAT_MIN_TOKENS", "4096"))
+    return spec.s >= min_tokens
 
 
 def _validate_common(
@@ -3421,7 +3471,7 @@ def forward_scalar_top1_debug(
 
 def _poll_tdm_heartbeat(debug_state: torch.Tensor, num_programs: int, *, label: str) -> None:
     deadline = time.monotonic() + float(os.environ.get("FLASHMOE_HOST_POLL_TIMEOUT_S", "60"))
-    poll_interval_s = float(os.environ.get("FLASHMOE_HOST_POLL_INTERVAL_S", "0.05"))
+    poll_interval_s = float(os.environ.get("FLASHMOE_HOST_POLL_INTERVAL_S", "0.001"))
     while True:
         state = debug_state[:num_programs].tolist()
         if all(value == 999 for value in state):
@@ -3491,6 +3541,49 @@ def forward_megakernel(
 
     if use_persistent and tdm_wmma_eligible:
         num_programs = _resolve_tdm_num_programs(spec.dtype, spec.block_h, num_programs)
+        debug_enabled_for_prime = (
+            os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
+            or _router_progress_heartbeat_enabled(spec)
+        )
+        if (
+            debug_enabled_for_prime
+            and num_programs >= 8
+            and os.environ.get("FLASHMOE_TDM_DEBUG_UNSAFE_8CTA", "0") != "1"
+        ):
+            num_programs = 2
+        prime_key = _tdm_wmma_8cta_prime_key(
+            "router",
+            tokens.device,
+            spec,
+            debug_enabled_for_prime,
+        )
+        if (
+            num_programs >= 8
+            and _tdm_wmma_8cta_prime_enabled()
+            and prime_key not in _tdm_wmma_8cta_prime_keys
+        ):
+            prime_out = forward_megakernel(
+                tokens,
+                gate_weights,
+                expert_up,
+                expert_down,
+                bias_up,
+                bias_down,
+                top_k=top_k,
+                expert_capacity=expert_capacity,
+                activation=activation,
+                expert_up_v=expert_up_v,
+                bias_up_v=bias_up_v,
+                block_h=block_h,
+                num_warps=num_warps,
+                num_programs=2,
+                use_persistent=use_persistent,
+                use_tdm_wmma=use_tdm_wmma,
+                return_counts=False,
+            )
+            torch.cuda.synchronize(device=tokens.device)
+            del prime_out
+            _tdm_wmma_8cta_prime_keys.add(prime_key)
 
     if use_persistent:
         expert_counts = torch.empty((spec.e,), device=tokens.device, dtype=torch.int32)
@@ -3519,7 +3612,7 @@ def forward_megakernel(
             tile_sync = torch.empty((spec.e * route_blocks,), device=tokens.device, dtype=torch.int32)
             debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
             debug_sched_enabled = os.environ.get("FLASHMOE_DEBUG_SCHED", "0") == "1"
-            progress_heartbeat = os.environ.get("FLASHMOE_PROGRESS_HEARTBEAT", "0") == "1"
+            progress_heartbeat = _router_progress_heartbeat_enabled(spec)
             debug_len = max(64, 56 + num_programs)
             debug_state = (
                 torch.zeros((debug_len,), dtype=torch.int32, pin_memory=True)
@@ -3778,7 +3871,13 @@ def forward_megakernel_from_topk(
         raise ValueError("persistent Gluon scheduling requires at least two programs")
     if spec.h % 64 != 0 or spec.i % 64 != 0:
         raise ValueError("precomputed-routing TDM/WMMA path requires H and I divisible by 64")
-    num_programs = _resolve_tdm_num_programs(spec.dtype, spec.block_h, num_programs)
+    num_programs = _resolve_precomputed_tdm_num_programs(spec, num_programs)
+    debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
+    debug_sched_enabled = os.environ.get("FLASHMOE_DEBUG_SCHED", "0") == "1"
+    # On gfx1250 the precomputed-routing persistent scheduler can occasionally
+    # fail to retire unless the host polls a heartbeat in pinned memory. Keep
+    # the stabilizer on by default for this path; profiling can still disable it.
+    progress_heartbeat = os.environ.get("FLASHMOE_PROGRESS_HEARTBEAT", "1") != "0"
 
     up_v_arg = expert_up_v if expert_up_v is not None else expert_up
     bias_up_v_arg = bias_up_v if bias_up_v is not None else bias_up
@@ -3803,12 +3902,6 @@ def forward_megakernel_from_topk(
     processor_seen = torch.empty((num_programs * 3,), device=tokens.device, dtype=torch.int32)
     barriers = torch.empty((6,), device=tokens.device, dtype=torch.int32)
     init_flag = torch.zeros((1,), device=tokens.device, dtype=torch.int32)
-    debug_trace_enabled = os.environ.get("FLASHMOE_DEBUG_STATE", "0") == "1"
-    debug_sched_enabled = os.environ.get("FLASHMOE_DEBUG_SCHED", "0") == "1"
-    # On gfx1250 the precomputed-routing persistent scheduler can occasionally
-    # fail to retire unless the host polls a heartbeat in pinned memory. Keep
-    # the stabilizer on by default for this path; profiling can still disable it.
-    progress_heartbeat = os.environ.get("FLASHMOE_PROGRESS_HEARTBEAT", "1") != "0"
     debug_len = max(64, 56 + num_programs)
     debug_state = (
         torch.zeros((debug_len,), dtype=torch.int32, pin_memory=True)
