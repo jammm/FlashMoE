@@ -129,6 +129,15 @@ consteval int getMoETileM() {
     return (clamped > 16) ? clamped : 16;
 }
 
+template<int M, int Arch, typename Element>
+consteval int getMoETileMForElement() {
+    constexpr int type_limit = (sizeof(Element) > 4) ? 32 :
+                               ((sizeof(Element) > 2) ? 64 :
+                                ((Arch >= 900 && M >= 4096 && M % 2 == 0) ? 256 : 128));
+    constexpr int clamped = (M < type_limit) ? M : type_limit;
+    return (clamped > 16) ? clamped : 16;
+}
+
 template<int N, typename Element>
 consteval int getTileN() {
     static_assert(N > 0 && N % 8 == 0);

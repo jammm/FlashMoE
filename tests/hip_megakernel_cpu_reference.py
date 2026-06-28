@@ -21,6 +21,26 @@ CUDA_DEFAULT_ATOL = 8e-3
 HIP_MEMCPY_DEVICE_TO_HOST = 2
 
 
+def _dtype_from_name(name: str) -> DataType:
+    if name == "fp16":
+        return DataType.FP16
+    if name == "bf16":
+        return DataType.BF16
+    if name == "fp32":
+        return DataType.FP32
+    raise ValueError(f"unsupported dtype: {name}")
+
+
+def _torch_dtype(data_type: DataType) -> torch.dtype:
+    if data_type == DataType.FP16:
+        return torch.float16
+    if data_type == DataType.BF16:
+        return torch.bfloat16
+    if data_type == DataType.FP32:
+        return torch.float32
+    raise ValueError(f"unsupported dtype: {data_type}")
+
+
 def _find_hip_runtime() -> Path:
     candidates = []
     try:
@@ -171,18 +191,20 @@ def _run_case(
     act_type: ActivationType,
     seed: int,
     arch: int,
+    data_type: DataType,
     rtol: float,
     atol: float,
 ) -> bool:
     stream = torch.cuda.Stream()
     stream_ptr = stream.cuda_stream
+    torch_dtype = _torch_dtype(data_type)
     flash = None
     router = None
     try:
         torch.manual_seed(seed)
         with torch.cuda.stream(stream):
             init_args = InitArgs(
-                DataType.FP16,
+                data_type,
                 s,
                 h,
                 i,
@@ -205,34 +227,34 @@ def _run_case(
             router = fm.router.initialize(init_args, return_logits=True)
 
             tokens = (
-                torch.randn((s, h), device="cuda", dtype=torch.float16) * 0.125
+                torch.randn((s, h), device="cuda", dtype=torch_dtype) * 0.125
             ).contiguous()
             gate = (
-                torch.randn((h, e), device="cuda", dtype=torch.float16) * 0.125
+                torch.randn((h, e), device="cuda", dtype=torch_dtype) * 0.125
             ).contiguous()
             counts = torch.zeros((e,), device="cuda", dtype=torch.int32)
             up = (
-                torch.randn((e, h, i), device="cuda", dtype=torch.float16) * 0.125
+                torch.randn((e, h, i), device="cuda", dtype=torch_dtype) * 0.125
             ).contiguous()
             bias_up = (
-                torch.randn((e, i), device="cuda", dtype=torch.float16) * 0.01
+                torch.randn((e, i), device="cuda", dtype=torch_dtype) * 0.01
             ).contiguous()
             up_v = None
             bias_up_v = None
             if mlp_type == MLPType.GATED:
                 up_v = (
-                    torch.randn((e, h, i), device="cuda", dtype=torch.float16) * 0.125
+                    torch.randn((e, h, i), device="cuda", dtype=torch_dtype) * 0.125
                 ).contiguous()
                 bias_up_v = (
-                    torch.randn((e, i), device="cuda", dtype=torch.float16) * 0.01
+                    torch.randn((e, i), device="cuda", dtype=torch_dtype) * 0.01
                 ).contiguous()
             down = (
-                torch.randn((e, i, h), device="cuda", dtype=torch.float16) * 0.125
+                torch.randn((e, i, h), device="cuda", dtype=torch_dtype) * 0.125
             ).contiguous()
             bias_down = (
-                torch.randn((e, h), device="cuda", dtype=torch.float16) * 0.01
+                torch.randn((e, h), device="cuda", dtype=torch_dtype) * 0.01
             ).contiguous()
-            out = torch.empty((s, h), device="cuda", dtype=torch.float16)
+            out = torch.empty((s, h), device="cuda", dtype=torch_dtype)
             routing = torch.empty((s, e), device="cuda", dtype=torch.float32)
 
             fm.router.forward(
@@ -308,7 +330,7 @@ def _run_case(
         ok = matches == total
         error_pct = 100.0 * (1.0 - matches / total)
         print(
-            f"{name}: result={'PASS' if ok else 'FAIL'} matches={matches}/{total} "
+            f"{name}: dtype={torch_dtype} result={'PASS' if ok else 'FAIL'} matches={matches}/{total} "
             f"error_pct={error_pct:.4f} counts={counts_cpu.tolist()} "
             f"prob_sum_range=[{min(prob_sums):.8f},{max(prob_sums):.8f}] "
             f"max_abs={float(diff.max()):.8f} mean_abs={float(diff.mean()):.8f}"
@@ -329,10 +351,12 @@ def main() -> None:
     parser.add_argument("--i", type=int, default=64)
     parser.add_argument("--e", type=int, default=4)
     parser.add_argument("--arch", type=int, default=1250)
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--rtol", type=float, default=CUDA_DEFAULT_RTOL)
     parser.add_argument("--atol", type=float, default=CUDA_DEFAULT_ATOL)
     parser.add_argument("--seed", type=int, default=123)
     args = parser.parse_args()
+    data_type = _dtype_from_name(args.dtype)
 
     if fm.BACKEND != "hip":
         raise RuntimeError(
@@ -371,6 +395,7 @@ def main() -> None:
                 act_type=act_type,
                 seed=seed,
                 arch=args.arch,
+                data_type=data_type,
                 rtol=args.rtol,
                 atol=args.atol,
             )
@@ -379,7 +404,10 @@ def main() -> None:
 
     if not all_ok:
         raise SystemExit(2)
-    print(f"ALL_PASS hip_megakernel_cpu_reference rtol={args.rtol} atol={args.atol}")
+    print(
+        f"ALL_PASS hip_megakernel_cpu_reference dtype={args.dtype} "
+        f"rtol={args.rtol} atol={args.atol}"
+    )
 
 
 if __name__ == "__main__":

@@ -339,13 +339,16 @@ constexpr uint kernelSMEM(const uint& E, const uint& EC, const int& world,
         (sizeof(Element) == 2) &&
         cuda::std::is_same_v<AccumType, float>;
 
+    constexpr auto GEMM0ScalarBaseSz =
+        sizeof(AccumType) * bM * bN0 +
+        sizeof(Element) * bK0 * (bM + bN0);
     constexpr auto GEMM0ScalarSz =
-        maxVal(sizeof(Element) * bK0 * pSK0 * (bM + bN0),
-               sizeof(AccumType) * bM * bN0) +
-        (mt == static_cast<int>(MLPMatmulType::gated) ? sizeof(AccumType) * bM * bN0 : 0);
+        mt == static_cast<int>(MLPMatmulType::gated)
+            ? roundUp(GEMM0ScalarBaseSz, MAX_ALIGNMENT) + sizeof(AccumType) * bM * bN0
+            : GEMM0ScalarBaseSz;
     constexpr auto GEMM1ScalarSz =
-        maxVal(sizeof(Element) * bK1 * pSK1 * (bM + bN1),
-               sizeof(AccumType) * bM * bN1);
+        sizeof(AccumType) * bM * bN1 +
+        sizeof(Element) * bK1 * (bM + bN1);
     constexpr auto GEMM0WmmaSz = useWmmaProcessor
         ? wmma_tdm::wmmaTdmWorkspaceBytes<GEMM0Mainloop, Element, AccumType>()
         : 0;
